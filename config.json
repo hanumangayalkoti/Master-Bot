@@ -1,0 +1,23 @@
+{
+  "folder_link": "https://t.me/addlist/0xmOmfkHmF1jOGY1",
+  "groups": [
+    {
+      "name": "Category Specific",
+      "enabled": true,
+      "channels": [
+        { "channel": "@DealsKotiFitness",     "categories": ["fitness"] },
+        { "channel": "@DealsKotiFashion",     "categories": ["fashion"] },
+        { "channel": "@DealsKotiElectronics", "categories": ["electronics"] },
+        { "channel": "@DealsKotiGrocery",     "categories": ["home"] },
+        { "channel": "@DealsKotiSkinCare",    "categories": ["skincare"] }
+      ]
+    },
+    {
+      "name": "Main Mega Channel",
+      "enabled": false,
+      "channels": [
+        { "channel": "@DealKoti", "categories": ["fitness","fashion","electronics","home","skincare"] }
+      ]
+    }
+  ]
+}
