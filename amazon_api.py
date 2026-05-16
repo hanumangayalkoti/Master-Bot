@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 import aiohttp
 import urllib.parse
@@ -35,24 +36,25 @@ async def _get_access_token() -> str | None:
                 "grant_type":    "client_credentials",
                 "client_id":     AMAZON_CLIENT_ID,
                 "client_secret": AMAZON_CLIENT_SECRET,
-                "scope":         "productads",
             }
             async with session.post(
                 LWA_TOKEN_URL, data=data, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
+                body = await resp.text()
                 if resp.status == 200:
-                    result = await resp.json()
-                    token      = result.get("access_token")
-                    expires_in = result.get("expires_in", 3600)
+                    result_json = json.loads(body)
+                    token       = result_json.get("access_token")
+                    expires_in  = result_json.get("expires_in", 3600)
                     _token_cache["token"]      = token
                     _token_cache["expires_at"] = now + timedelta(seconds=expires_in - 60)
                     logger.info("Amazon OAuth token mila!")
                     return token
-                body = await resp.text()
-                logger.error(f"Token error {resp.status}: {body[:300]}")
+                logger.error(f"Token error {resp.status}: {body[:500]}")
+                _token_cache["last_error"] = f"HTTP {resp.status}: {body[:300]}"
                 return None
     except Exception as e:
         logger.error(f"Token fetch fail: {e}")
+        _token_cache["last_error"] = str(e)
         return None
 
 
