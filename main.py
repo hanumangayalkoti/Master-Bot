@@ -544,8 +544,17 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if product and product.get("title"):
             caption_html = build_amazon_caption(product, short_link, raw_plain)
             detect_text  = product.get("title", "") + " " + raw_plain
+            logger.info(f"Amazon product mila: {product.get('title', '')[:60]}")
         else:
-            # API fail — purana format use karo, sirf link replace karo
+            # API fail — admin ko debug info do aur clean link ke saath post karo
+            logger.warning(f"Amazon API se product nahi mila: {amazon_url[:80]}")
+            await msg.reply_text(
+                f"⚠️ *Amazon API se data nahi mila*\n"
+                f"Link: `{short_link}`\n"
+                f"Abhi sirf affiliate link ke saath post ho raha hai.\n\n"
+                f"`/testamz` se API check karo.",
+                parse_mode="Markdown"
+            )
             cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
             body_html     = entities_to_html(cleaned_plain, cleaned_entities)
             body_replaced = body_html.replace(html_lib.escape(amazon_url), short_link)
