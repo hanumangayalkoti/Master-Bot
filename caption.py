@@ -4,8 +4,8 @@ import json
 import urllib.parse
 import openai
 
-EARNKARO_BASE = "https://fktr.in/0MCTP0G"
-URL_REGEX = r"(https?://[^\s\]\[<>\"']+)"
+ASSOCIATE_TAG   = "dealskoti-21"
+URL_REGEX       = r"(https?://[^\s\]\[<>\"']+)"
 
 PRICE_REGEX = re.compile(
     r"(?:₹|Rs\.?|INR)\s*(\d[\d,]*(?:\.\d{1,2})?)"
@@ -14,24 +14,19 @@ PRICE_REGEX = re.compile(
 )
 
 PLATFORM_EMOJIS = {
-    "Amazon":          "🛒",
-    "Flipkart":        "🛍️",
-    "Shopsy":          "🛍️",
-    "Myntra":          "👗",
-    "Ajio":            "👔",
-    "Meesho":          "🏷️",
-    "Nykaa":           "💄",
-    "Snapdeal":        "🎯",
-    "JioMart":         "🛒",
-    "TataCliq":        "🛒",
-    "Croma":           "🔌",
-    "Reliance Digital":"🔌",
+    "Amazon":           "🛒",
+    "Flipkart":         "🛍️",
+    "Shopsy":           "🛍️",
+    "Myntra":           "👗",
+    "Ajio":             "👔",
+    "Meesho":           "🏷️",
+    "Nykaa":            "💄",
+    "Snapdeal":         "🎯",
+    "JioMart":          "🛒",
+    "TataCliq":         "🛒",
+    "Croma":            "🔌",
+    "Reliance Digital": "🔌",
 }
-
-
-def _affiliate_url(url: str) -> str:
-    encoded = urllib.parse.quote(url, safe="")
-    return f"{EARNKARO_BASE}?redirect={encoded}"
 
 
 def _extract_price_from_text(text: str) -> str:
@@ -41,7 +36,9 @@ def _extract_price_from_text(text: str) -> str:
     return ""
 
 
-def _ai_title_and_price(message_text: str, title: str, scraped_text: str, platform: str) -> tuple:
+def _ai_title_and_price(
+    message_text: str, title: str, scraped_text: str, platform: str
+) -> tuple:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None, None
@@ -80,6 +77,79 @@ def _ai_title_and_price(message_text: str, title: str, scraped_text: str, platfo
         return None, None
 
 
+# =============================================================================
+# AMAZON CAPTION — API data se rich format
+# =============================================================================
+def build_amazon_caption(
+    product: dict,
+    short_link: str,
+    original_message: str = "",
+) -> str:
+    """
+    Amazon PA API product dict se caption banao.
+    Format:
+      🙏Jai Shree Ram Dosto🙏
+
+      🔥 [Title]
+
+      💰 Actual Price:    ₹X,XXX
+      🏷️ Discounted Price: ₹X,XXX
+      📉 Discount:         XX% OFF
+
+      🛒 Buy Now → [short link]
+    """
+    title        = product.get("title", "").strip()
+    actual_price = product.get("actual_price", "").strip()
+    deal_price   = product.get("deal_price", "").strip()
+    discount_pct = product.get("discount_pct", 0)
+    rating       = product.get("rating", "").strip()
+    review_count = product.get("review_count", "").strip()
+
+    # Title — AI se catchy banao ya as-is raho
+    if original_message:
+        ai_title, _ = _ai_title_and_price(original_message, title, "", "Amazon")
+        display_title = ai_title or (f"🔥 {title}" if title else "🔥 Hot Deal!")
+    else:
+        display_title = f"🔥 {title}" if title else "🔥 Hot Deal!"
+
+    lines = []
+    lines.append("🙏Jai Shree Ram Dosto🙏")
+    lines.append("")
+    lines.append(display_title)
+    lines.append("")
+
+    if actual_price and deal_price and actual_price != deal_price:
+        lines.append(f"💰 Actual Price:      <s>{actual_price}</s>")
+        lines.append(f"🏷️ Discounted Price: <b>{deal_price}</b>")
+    elif deal_price:
+        lines.append(f"🏷️ Price: <b>{deal_price}</b>")
+    elif actual_price:
+        lines.append(f"🏷️ Price: <b>{actual_price}</b>")
+
+    if discount_pct and int(discount_pct) > 0:
+        lines.append(f"📉 Discount:          <b>{discount_pct}% OFF</b>")
+
+    if rating:
+        rating_line = f"⭐ Rating: {rating}/5"
+        if review_count:
+            rating_line += f" ({review_count} reviews)"
+        lines.append(rating_line)
+
+    lines.append("")
+    lines.append(f"🛒 <b><a href=\"{short_link}\">Buy Now →</a></b>")
+
+    caption = "\n".join(lines)
+
+    # Telegram caption limit 1024 chars
+    if len(caption) > 1024:
+        caption = caption[:1020] + "..."
+
+    return caption
+
+
+# =============================================================================
+# EXISTING CAPTION — non-Amazon ya fallback ke liye
+# =============================================================================
 def build_caption(
     content: str,
     platform: str,
@@ -90,11 +160,8 @@ def build_caption(
 ) -> str:
     emoji = PLATFORM_EMOJIS.get(platform, "🔥")
 
-    def replace_url(m):
-        return _affiliate_url(m.group(1))
-
-    body = re.sub(URL_REGEX, replace_url, content)
-    body = "\n".join(line.strip() for line in body.strip().splitlines() if line.strip())
+    body = content.strip()
+    body = "\n".join(line.strip() for line in body.splitlines() if line.strip())
 
     if single_link:
         price = scraped_price or _extract_price_from_text(content)
