@@ -82,28 +82,10 @@ def make_affiliate_url(asin: str) -> str:
     return f"https://www.amazon.in/dp/{asin}?tag={ASSOCIATE_TAG}"
 
 
-async def make_short_link(long_url: str) -> str:
-    """TinyURL se short link banao."""
-    try:
-        encoded = urllib.parse.quote(long_url, safe="")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://tinyurl.com/api-create.php?url={encoded}",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    short = (await resp.text()).strip()
-                    if short.startswith("http"):
-                        return short
-    except Exception as e:
-        logger.warning(f"TinyURL fail, long URL use kar raha hoon: {e}")
-    return long_url
-
-
 async def get_short_affiliate_link(url: str) -> str:
     """
-    Amazon URL → affiliate URL → TinyURL short link.
-    ASIN nahi mila to original URL return karo.
+    Amazon URL se ASIN nikalo aur affiliate tag wali clean URL banao.
+    amzn.to ya koi short URL nahi — direct amazon.in/dp/ASIN?tag=dealskoti-21
     """
     asin = extract_asin(url)
     if not asin:
@@ -113,9 +95,10 @@ async def get_short_affiliate_link(url: str) -> str:
         except Exception:
             pass
     if asin:
-        affiliate = make_affiliate_url(asin)
-        return await make_short_link(affiliate)
-    return url
+        return make_affiliate_url(asin)
+    # ASIN nahi mila — original URL mein tag add karo
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}tag={ASSOCIATE_TAG}"
 
 
 async def _resolve_redirect(url: str) -> str:
