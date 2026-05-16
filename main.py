@@ -281,11 +281,10 @@ async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔄 Amazon API test ho rahi hai...")
     try:
-        from amazon_api import get_product_by_asin, make_short_link, make_affiliate_url
+        from amazon_api import get_product_by_asin, make_affiliate_url
         test_asin    = "B08N5WRWNW"
         product      = await get_product_by_asin(test_asin)
-        affiliate    = make_affiliate_url(test_asin)
-        short        = await make_short_link(affiliate)
+        short        = make_affiliate_url(test_asin)
         if product and product.get("title"):
             await update.message.reply_text(
                 f"✅ *Amazon API kaam kar raha hai!*\n\n"
