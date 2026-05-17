@@ -327,6 +327,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addgroup — Naya group banao\n"
         "/addchannel — Existing group mein naya channel add karo\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🗑️ *DELETE*\n"
         "/deletegroup — Poora group delete karo\n"
         "/deletechannel — Group ke andar se koi channel hatao\n\n"
@@ -529,10 +530,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ==========================================================================
     # CASE 1: Single Amazon link
-    #   → API se rich data lo
-    #   → Caption rewrite karo (actual price, deal price, discount%)
-    #   → Agar photo nahi → API image se photo bhejo
-    #   → Agar photo hai → same photo rakho, caption update karo
     # ==========================================================================
     if single_amazon and has_amazon:
         await msg.reply_text("⏳ Amazon product data fetch ho raha hai...")
@@ -546,7 +543,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             detect_text  = product.get("title", "") + " " + raw_plain
             logger.info(f"Amazon product mila: {product.get('title', '')[:60]}")
         else:
-            # API fail — admin ko debug info do aur clean link ke saath post karo
             logger.warning(f"Amazon API se product nahi mila: {amazon_url[:80]}")
             await msg.reply_text(
                 f"⚠️ *Amazon API se data nahi mila*\n"
@@ -579,7 +575,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         async def send_single_amazon(channel):
             if has_photo:
-                # Photo already hai → copy karo, sirf caption badlo
                 await context.bot.copy_message(
                     chat_id=channel,
                     from_chat_id=msg.chat_id,
@@ -589,7 +584,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=final_markup
                 )
             elif image_url:
-                # Photo nahi thi → API image se bhejo
                 await context.bot.send_photo(
                     chat_id=channel,
                     photo=image_url,
@@ -598,11 +592,12 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=final_markup
                 )
             else:
-                # Na photo na API image → plain text bhejo
+                # ── CHANGE: disable_web_page_preview=True ──
                 await context.bot.send_message(
                     chat_id=channel,
                     text=caption_html,
                     parse_mode="HTML",
+                    disable_web_page_preview=True,
                     reply_markup=final_markup
                 )
 
@@ -612,8 +607,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ==========================================================================
     # CASE 2: Multiple links ya Amazon + non-Amazon mix
-    #   → Text same rakho, sirf Amazon links ko short affiliate links se replace karo
-    #   → Normal processing (category detect, post)
     # ==========================================================================
     if has_amazon and not single_amazon:
         await msg.reply_text("⏳ Links replace ho rahi hain...")
@@ -659,10 +652,12 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=final_markup
             )
         elif msg.text:
+            # ── CHANGE: disable_web_page_preview=True ──
             await context.bot.send_message(
                 chat_id=channel,
                 text=final_html,
                 parse_mode="HTML",
+                disable_web_page_preview=True,
                 reply_markup=final_markup
             )
         else:
