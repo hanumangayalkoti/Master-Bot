@@ -10,8 +10,12 @@ logger = logging.getLogger(__name__)
 CREDENTIAL_ID      = os.getenv("CREDENTIAL_ID", "")
 CREDENTIAL_SECRET  = os.getenv("CREDENTIAL_SECRET", "")
 CREDENTIAL_VERSION = os.getenv("CREDENTIAL_VERSION", "3.2")
-PARTNER_TAG        = os.getenv("PARTNER_TAG", "dealskoti-21")
 MARKETPLACE        = os.getenv("MARKETPLACE", "www.amazon.in")
+
+# PARTNER_TAG: Railway variable se aata hai — koi hardcoded default nahi
+PARTNER_TAG = os.getenv("PARTNER_TAG", "")
+if not PARTNER_TAG:
+    logger.warning("PARTNER_TAG env var set nahi hai! Affiliate links mein tag nahi hoga.")
 
 VERSION_TOKEN_URLS = {
     "2.1": "https://creatorsapi.auth.us-east-1.amazoncognito.com/oauth2/token",
@@ -107,8 +111,30 @@ def is_amazon_search_url(url: str) -> bool:
     return any(m in url for m in markers)
 
 
+def _strip_tag_param(url: str) -> str:
+    """
+    Kisi bhi existing affiliate tag= parameter ko URL se remove karo.
+    Ensures sirf ek hi clean tag lagta hai — purana kisi aur ka tag nahi rahega.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        params.pop("tag", None)
+        new_query = urllib.parse.urlencode(params, doseq=True)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+    except Exception:
+        return url
+
+
 def make_affiliate_url(asin: str) -> str:
-    return f"https://www.amazon.in/dp/{asin}?tag={PARTNER_TAG}"
+    """
+    Clean affiliate URL — sirf ASIN aur PARTNER_TAG, kuch aur nahi.
+    MARKETPLACE env var se domain aata hai.
+    """
+    base = f"https://{MARKETPLACE}/dp/{asin}"
+    if PARTNER_TAG:
+        return f"{base}?tag={PARTNER_TAG}"
+    return base
 
 
 async def _resolve_redirect(url: str) -> str:
@@ -126,14 +152,26 @@ async def _resolve_redirect(url: str) -> str:
 
 
 async def get_short_affiliate_link(url: str) -> str:
+    """
+    Amazon URL ko clean affiliate link mein convert karo.
+    - ASIN milne pe: ekdum clean URL (https://domain/dp/ASIN?tag=TAG)
+    - ASIN nahi milne pe: existing tag strip karke sirf apna tag add karo
+    """
     asin = extract_asin(url)
     if not asin:
         resolved = await _resolve_redirect(url)
         asin = extract_asin(resolved)
+
     if asin:
+        # Best case: clean ASIN-based URL
         return make_affiliate_url(asin)
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}tag={PARTNER_TAG}"
+
+    # Fallback: strip any old tag, add ours
+    cleaned = _strip_tag_param(url)
+    if PARTNER_TAG:
+        sep = "&" if "?" in cleaned else "?"
+        return f"{cleaned}{sep}tag={PARTNER_TAG}"
+    return cleaned
 
 
 def _parse_item(item: dict) -> dict:
@@ -168,7 +206,7 @@ def _parse_item(item: dict) -> dict:
             sav_amt = float(sav_money.get("amount", 0) or 0)
             result["savings"] = sav_money.get("displayAmount", "")
             if sav_amt and result["deal_amount"]:
-                mrp_amt                = result["deal_amount"] + sav_amt
+                mrp_amt                 = result["deal_amount"] + sav_amt
                 result["actual_amount"] = mrp_amt
                 result["actual_price"]  = f"₹{mrp_amt:,.0f}"
 
@@ -227,7 +265,7 @@ async def get_product_by_asin(asin: str) -> dict | None:
                 items = data.get("itemsResult", {}).get("items", [])
                 if items:
                     parsed = _parse_item(items[0])
-                    parsed["asin"]          = asin
+                    parsed["asin"]           = asin
                     parsed["affiliate_link"] = make_affiliate_url(asin)
                     logger.info(f"Creators API product mila: {asin}")
                     return parsed
