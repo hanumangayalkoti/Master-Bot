@@ -1,7 +1,6 @@
 import os
 import re
 import html as html_lib
-import json
 import logging
 import urllib.parse
 from telegram import (
@@ -14,8 +13,7 @@ from telegram.ext import (
 from classifier import detect_category
 from amazon_api import (
     is_amazon_url, is_amazon_search_url, enrich_amazon_url,
-    get_short_affiliate_link, extract_asin, make_affiliate_url,
-    _resolve_redirect,
+    get_short_affiliate_link, _resolve_redirect,
 )
 from caption import build_amazon_caption, _safe_truncate, _TAG_RE
 from database import is_duplicate, mark_posted, cleanup_old_entries
@@ -28,8 +26,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID           = int(os.getenv("ADMIN_ID", "0"))
-ALL_CATS           = ["fitness", "fashion", "electronics", "home", "skincare"]
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
+    logger.error("ADMIN_ID env var must be a number!")
+
+ALL_CATS = ["fitness", "fashion", "electronics", "home", "skincare"]
 
 URL_REGEX = re.compile(r"(https?://[^\s\]\[<>\"']+)")
 
@@ -55,10 +58,6 @@ def extract_urls(text: str) -> list:
 
 def get_amazon_urls(urls: list) -> list:
     return [u for u in urls if is_amazon_url(u)]
-
-
-def get_non_amazon_urls(urls: list) -> list:
-    return [u for u in urls if not is_amazon_url(u)]
 
 
 async def replace_amazon_links(text: str, urls: list) -> str:
@@ -286,7 +285,6 @@ def _channel_select_kb(group_idx, prefix):
 
 
 def _setbutton_status_text(buttons: dict) -> str:
-    """Build the status lines shown in the /setbutton message (outside buttons)."""
     b1 = buttons.get("btn1", {})
     b2 = buttons.get("btn2", {})
     b1_status = "✅ ON" if b1.get("enabled") else "❌ OFF"
@@ -305,12 +303,14 @@ def _setbutton_status_text(buttons: dict) -> str:
     )
 
 
-def _setbutton_main_kb() -> InlineKeyboardMarkup:
-    """Main /setbutton keyboard — no status inside button labels."""
+def _setbutton_main_kb(buttons: dict) -> InlineKeyboardMarkup:
+    """Main /setbutton keyboard — shows actual button names."""
+    b1_label = buttons.get("btn1", {}).get("label", "Button 1")
+    b2_label = buttons.get("btn2", {}).get("label", "Button 2")
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Configure Button 1", callback_data="sb_b1")],
-        [InlineKeyboardButton("✏️ Configure Button 2", callback_data="sb_b2")],
-        [InlineKeyboardButton("❌ Cancel",             callback_data="cancel")],
+        [InlineKeyboardButton(f"✏️ {b1_label}", callback_data="sb_btn1")],
+        [InlineKeyboardButton(f"✏️ {b2_label}", callback_data="sb_btn2")],
+        [InlineKeyboardButton("❌ Cancel",       callback_data="cancel")],
     ])
 
 
@@ -325,7 +325,6 @@ def _setbutton_detail_kb(btn_key: str, btn: dict) -> InlineKeyboardMarkup:
 
 
 def _btn_detail_text(btn_key: str, btn: dict) -> str:
-    """Full status text for a single button detail screen."""
     num    = btn_key[-1]
     label  = btn.get("label", f"Button {num}")
     url    = btn.get("url") or "Set nahi hua"
@@ -406,8 +405,7 @@ async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "⚠️ Amazon API se product data nahi mila.\n"
-                "CREDENTIAL_ID aur CREDENTIAL_SECRET check karo.\n\n"
-                "/testamz se dobara check karo.",
+                "CREDENTIAL_ID aur CREDENTIAL_SECRET check karo.",
                 parse_mode="HTML"
             )
     except Exception as e:
@@ -422,36 +420,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📖 <b>DealsKoti Bot — Sare Commands</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>STATUS</b>\n"
-        "/status — Sare groups, channels aur categories dekho\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔁 <b>ON / OFF</b>\n"
-        "/manage — Groups ko ON ya OFF karo\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✏️ <b>EDIT</b>\n"
-        "/editgroup — Channel ki categories badlo\n"
-        "/rename — Group ka naam badlo\n"
-        "/setbutton — Har post ke neeche 2 customisable buttons set karo\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "➕ <b>ADD</b>\n"
-        "/addgroup — Naya group banao\n"
-        "/addchannel — Existing group mein naya channel add karo\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🗑️ <b>DELETE</b>\n"
-        "/deletegroup — Poora group delete karo\n"
-        "/deletechannel — Group ke andar se koi channel hatao\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🧪 <b>TEST</b>\n"
-        "/testai — OpenAI API test karo\n"
-        "/testamz — Amazon Creators API test karo\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💾 <b>BACKUP</b>\n"
-        "/exportconfig — Config JSON export karo (backup ke liye)\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "ℹ️ <b>OTHER</b>\n"
-        "/start — Bot ki info\n"
-        "/help — Ye poori list",
+        "📊 /status — Groups, channels aur buttons dekho\n"
+        "🔁 /manage — Groups ON/OFF karo\n"
+        "✏️ /editgroup — Channel ki categories badlo\n"
+        "✏️ /rename — Group naam badlo\n"
+        "🎛️ /setbutton — Post ke neeche buttons set karo\n"
+        "➕ /addgroup — Naya group banao\n"
+        "➕ /addchannel — Group mein channel add karo\n"
+        "🗑️ /deletegroup — Group delete karo\n"
+        "🗑️ /deletechannel — Channel hatao\n"
+        "🧪 /testai — OpenAI API test karo\n"
+        "🧪 /testamz — Amazon API test karo\n"
+        "💾 /exportconfig — Config backup karo\n"
+        "ℹ️ /start — Bot ki info",
         parse_mode="HTML"
     )
 
@@ -469,8 +450,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         "⚙️ <b>Bot Status</b>\n",
         "🎛️ <b>Buttons:</b>",
-        f"  Button 1: {'✅ ON' if b1.get('enabled') else '❌ OFF'} — <b>{b1.get('label', '-')}</b>",
-        f"  Button 2: {'✅ ON' if b2.get('enabled') else '❌ OFF'} — <b>{b2.get('label', '-')}</b>",
+        f"  Button 1: {'✅ ON' if b1.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b1.get('label', '-'))}</b>",
+        f"  Button 2: {'✅ ON' if b2.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b2.get('label', '-'))}</b>",
         "",
     ]
 
@@ -536,7 +517,7 @@ async def cmd_setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + _setbutton_status_text(buttons)
         + "\n\n<i>Kaun sa configure karna hai?</i>",
         parse_mode="HTML",
-        reply_markup=_setbutton_main_kb()
+        reply_markup=_setbutton_main_kb(buttons)
     )
 
 
@@ -590,12 +571,12 @@ async def cmd_deletechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    import json
     config      = load_config()
     config_json = json.dumps(config, indent=2, ensure_ascii=False)
     await update.message.reply_text(
         f"📦 <b>Config Export (Backup)</b>\n\n"
-        f"Is JSON ko copy karke safe jagah save karo.\n"
-        f"Naya bot banane ke baad config.json file mein paste karo.\n\n"
+        f"Is JSON ko copy karke safe jagah save karo.\n\n"
         f"<pre>{html_lib.escape(config_json)}</pre>",
         parse_mode="HTML"
     )
@@ -628,10 +609,9 @@ async def _post_to_channels(context, config, category, send_fn) -> tuple:
 # MAIN DEAL HANDLER
 # =============================================================================
 async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
 
-    # Delegate to text-input handler when a multi-step action is active
     action = context.user_data.get("action")
     if action:
         await handle_text_input(update, context)
@@ -655,24 +635,21 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_urls      = extract_urls(raw_plain)
     amazon_urls   = get_amazon_urls(all_urls)
     has_amazon    = len(amazon_urls) > 0
-    single_amazon = len(amazon_urls) == 1 and len(all_urls) == 1
+    single_amazon = len(amazon_urls) == 1
 
-    # No content at all
     if not raw_plain.strip() and not all_urls and not has_photo:
         await msg.reply_text("⚠️ Message mein koi text ya link nahi mila.")
         return
 
-    # Photo without any text or link — can't categorize
     if not raw_plain.strip() and not all_urls and has_photo:
         await msg.reply_text(
-            "⚠️ Photo ke saath product ka naam ya link bhi bhejo — tabhei post ho sakta hai."
+            "⚠️ Photo ke saath product ka naam ya link bhi bhejo."
         )
         return
 
     config       = load_config()
     final_markup = build_final_markup(config)
 
-    # Periodic cleanup of old duplicate entries
     try:
         cleanup_old_entries()
     except Exception:
@@ -684,7 +661,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if single_amazon and has_amazon:
         amazon_url = amazon_urls[0]
 
-        # Resolve short links before search-page check
         resolved_url = amazon_url
         if "amzn.to" in amazon_url or "amzn.in" in amazon_url:
             resolved_url = await _resolve_redirect(amazon_url)
@@ -708,13 +684,12 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dup, dup_time = is_duplicate(title)
             if dup:
                 await wait_msg.edit_text(
-                    f"⚠️ <b>Yeh deal {dup_time} pehle already post ho chuki hai — skip kiya.</b>\n\n"
+                    f"⚠️ <b>Yeh deal {dup_time} already post ho chuki hai — skip kiya.</b>\n\n"
                     f"🏷️ {html_lib.escape(title[:80])}",
                     parse_mode="HTML"
                 )
                 return
 
-            # FIX: await the async caption builder (was sync before — blocked event loop)
             caption_html = await build_amazon_caption(product, short_link, raw_plain)
             image_url    = product.get("image_url", "")
             api_note     = ""
@@ -727,13 +702,10 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             escaped_url  = html_lib.escape(amazon_url)
             body_html    = body_html.replace(escaped_url, f'<a href="{short_link}">{short_link}</a>')
             raw_caption  = "🙏Jai Shree Ram Dosto🙏\n\n" + body_html
-            # FIX: truncate based on visible text (not HTML tag length)
             caption_html = _safe_truncate(raw_caption, max_visible=1020)
 
         await wait_msg.delete()
 
-        # When API fails, extract product words from Amazon URL slug
-        # e.g. /Calvin-Klein-Regular-Shirt/dp/B08X → "Calvin Klein Regular Shirt"
         url_slug_words = ""
         if not product:
             try:
@@ -807,14 +779,29 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ==========================================================================
     # CASE 2: Multiple links or non-Amazon — normal post with affiliate links
     # ==========================================================================
-    if has_amazon and not single_amazon:
-        updated_plain = await replace_amazon_links(raw_plain, amazon_urls)
-    else:
-        updated_plain = raw_plain
 
-    cleaned_plain, cleaned_entities = remove_footer(updated_plain, raw_entities)
+    # FIX: Remove footer FIRST (on original text with correct entity offsets),
+    # THEN replace amazon links in the cleaned text
+    cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
+
+    if has_amazon:
+        updated_plain = await replace_amazon_links(cleaned_plain, amazon_urls)
+    else:
+        updated_plain = cleaned_plain
+
+    # Duplicate check for non-Amazon messages — based on caption text
+    dup_key = raw_plain.strip()[:300]
+    if dup_key:
+        dup, dup_time = is_duplicate(dup_key)
+        if dup:
+            await msg.reply_text(
+                f"⚠️ <b>Yeh message {dup_time} already post ho chuka hai — skip kiya.</b>",
+                parse_mode="HTML"
+            )
+            return
+
     GREETING   = "🙏Jai Shree Ram Dosto🙏\n\n"
-    body_html  = entities_to_html(cleaned_plain, cleaned_entities)
+    body_html  = entities_to_html(updated_plain, cleaned_entities)
     final_html = GREETING + body_html
 
     try:
@@ -863,6 +850,10 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     sent_channels, errors = await _post_to_channels(context, config, category, send_normal)
+
+    if sent_channels and dup_key:
+        mark_posted(dup_key)
+
     await _send_admin_reply(
         msg,
         headline      = "✅ <b>Post Ho Gaya!</b>" if sent_channels else "⚠️ <b>Koi channel nahi mila!</b>",
@@ -880,12 +871,14 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query.from_user or not is_admin(query.from_user.id):
+        await query.answer("Unauthorized.")
+        return
     await query.answer()
     data   = query.data
     config = load_config()
     groups = config.get("groups", [])
 
-    # ── Cancel ──
     if data == "cancel":
         context.user_data.clear()
         try:
@@ -894,7 +887,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ── Group toggle ──
     if data.startswith("toggle_") and data != "toggle_done":
         try:
             idx = int(data.split("_")[1])
@@ -915,7 +907,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ── Edit group ──
     if data.startswith("eg_group_"):
         try:
             gi      = int(data.split("_")[2])
@@ -1103,7 +1094,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================================================
-    # /setbutton callbacks
+    # /setbutton callbacks — btn_key is always "btn1" or "btn2"
     # ==========================================================================
     if data == "sb_main":
         cfg     = load_config()
@@ -1114,14 +1105,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + _setbutton_status_text(buttons)
                 + "\n\n<i>Kaun sa configure karna hai?</i>",
                 parse_mode="HTML",
-                reply_markup=_setbutton_main_kb()
+                reply_markup=_setbutton_main_kb(buttons)
             )
         except Exception:
             pass
         return
 
-    if data in ("sb_b1", "sb_b2"):
-        btn_key = data[3:]           # "b1" or "b2"
+    if data in ("sb_btn1", "sb_btn2"):
+        btn_key = data.split("_")[1]   # "btn1" or "btn2"
         cfg     = load_config()
         btn     = cfg.get("buttons", {}).get(btn_key, {})
         try:
@@ -1134,8 +1125,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data in ("sb_b1_toggle", "sb_b2_toggle"):
-        btn_key = data[3:5]          # "b1" or "b2"
+    if data in ("sb_btn1_toggle", "sb_btn2_toggle"):
+        btn_key = data.split("_")[1]   # "btn1" or "btn2"
         cfg     = load_config()
         buttons = cfg.setdefault("buttons", {})
         btn     = buttons.setdefault(btn_key, {})
@@ -1153,8 +1144,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data in ("sb_b1_rename", "sb_b2_rename"):
-        btn_key = data[3:5]
+    if data in ("sb_btn1_rename", "sb_btn2_rename"):
+        btn_key = data.split("_")[1]
         context.user_data["action"]     = f"sb_{btn_key}_wait_label"
         context.user_data["sb_btn_key"] = btn_key
         try:
@@ -1166,8 +1157,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data in ("sb_b1_link", "sb_b2_link"):
-        btn_key = data[3:5]
+    if data in ("sb_btn1_link", "sb_btn2_link"):
+        btn_key = data.split("_")[1]
         context.user_data["action"]     = f"sb_{btn_key}_wait_link"
         context.user_data["sb_btn_key"] = btn_key
         try:
@@ -1179,8 +1170,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data in ("sb_b1_confirm", "sb_b2_confirm"):
-        btn_key  = data[3:5]
+    if data in ("sb_btn1_confirm", "sb_btn2_confirm"):
+        btn_key  = data.split("_")[1]
         new_val  = context.user_data.pop(f"sb_{btn_key}_pending", None)
         field    = context.user_data.pop(f"sb_{btn_key}_field",   None)
         context.user_data.pop("action", None)
@@ -1192,7 +1183,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons[btn_key] = btn
             cfg["buttons"]   = buttons
             save_config(cfg)
-        # Reload after save so displayed data is always fresh from DB
         btn = load_config().get("buttons", {}).get(btn_key, btn)
         try:
             await query.edit_message_text(
@@ -1204,8 +1194,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data in ("sb_b1_cancel_edit", "sb_b2_cancel_edit"):
-        btn_key = data[3:5]
+    if data in ("sb_btn1_cancel_edit", "sb_btn2_cancel_edit"):
+        btn_key = data.split("_")[1]
         context.user_data.pop(f"sb_{btn_key}_pending", None)
         context.user_data.pop(f"sb_{btn_key}_field",   None)
         context.user_data.pop("action", None)
@@ -1234,9 +1224,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not action:
         return
 
-    # ── /setbutton: button rename ──
     if action.endswith("_wait_label"):
-        btn_key = context.user_data.get("sb_btn_key", "b1")
+        btn_key = context.user_data.get("sb_btn_key", "btn1")
         if len(text) > 20:
             await update.message.reply_text("⚠️ Naam max 20 characters hona chahiye.")
             return
@@ -1253,9 +1242,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── /setbutton: button link ──
     if action.endswith("_wait_link"):
-        btn_key = context.user_data.get("sb_btn_key", "b1")
+        btn_key = context.user_data.get("sb_btn_key", "btn1")
         if text.startswith("t.me/"):
             text = "https://" + text
         if not (text.startswith("https://") or text.startswith("http://")):
@@ -1276,7 +1264,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── /addgroup ──
     if action == "wait_group_name":
         context.user_data["new_group_name"] = text
         context.user_data["action"] = "wait_group_channel"
@@ -1297,7 +1284,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── /addchannel ──
     if action == "wait_channel_name":
         context.user_data["new_channel_name"] = text
         context.user_data["action"] = "adding_channel_cats"
@@ -1309,7 +1295,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── /rename ──
     if action == "wait_rename":
         gi = context.user_data.get("rename_group_idx", 0)
         cfg = load_config()
@@ -1330,8 +1315,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable set nahi hai!")
+    if ADMIN_ID == 0:
+        raise ValueError("ADMIN_ID environment variable set nahi hai ya invalid hai!")
 
-    # Initialize PostgreSQL tables on startup
     try:
         init_db()
     except Exception as e:
