@@ -47,7 +47,7 @@ PRODUCT_RESOURCES = [
 
 
 async def _get_token() -> str | None:
-    now = datetime.utcnow()
+    now = datetime.now()
     if _token_cache["token"] and _token_cache["expires_at"] and now < _token_cache["expires_at"]:
         return _token_cache["token"]
 
