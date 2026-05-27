@@ -1,14 +1,6 @@
 import os
 import re
-import json
-import urllib.parse
 import aiohttp
-
-PRICE_REGEX = re.compile(
-    r"(?:₹|Rs\.?|INR)\s*(\d[\d,]*(?:\.\d{1,2})?)"
-    r"|(\d[\d,]*(?:\.\d{1,2})?)\s*(?:₹|Rs\.?|INR)",
-    re.IGNORECASE,
-)
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
@@ -28,13 +20,6 @@ PLATFORM_EMOJIS = {
 }
 
 
-def _extract_price_from_text(text: str) -> str:
-    m = PRICE_REGEX.search(text)
-    if m:
-        return f"₹{m.group(1) or m.group(2)}"
-    return ""
-
-
 def _visible_len(html_text: str) -> int:
     """Telegram caption limit counts visible characters, not HTML tags."""
     return len(_TAG_RE.sub("", html_text))
@@ -43,21 +28,25 @@ def _visible_len(html_text: str) -> int:
 def _safe_truncate(html_text: str, max_visible: int = 1020) -> str:
     """
     Truncate caption so visible text <= max_visible chars.
-    If it's already within limit, return as-is.
-    If over limit, strip all HTML tags and truncate plain text.
+    Preserves the last line (buy link) when truncating.
     """
     if _visible_len(html_text) <= max_visible:
         return html_text
+
+    lines = html_text.rsplit("\n", 1)
+    if len(lines) == 2:
+        body, last_line = lines
+        last_visible = _visible_len(last_line) + 1  # +1 for the newline
+        body_limit = max_visible - last_visible - 3
+        body_plain = _TAG_RE.sub("", body)
+        if body_limit > 20:
+            return body_plain[:body_limit] + "...\n" + last_line
+
     plain = _TAG_RE.sub("", html_text)
     return plain[:max_visible - 3] + "..."
 
 
 def _shorten_amazon_title(title: str, max_words: int = 8) -> str:
-    """
-    Amazon titles bahut lambe hote hain (50+ words).
-    Pehle max_words words lo — short aur readable rahega.
-    Agar title pehle se chhota hai toh as-is return karo.
-    """
     if not title:
         return ""
     words = title.split()
@@ -67,19 +56,15 @@ def _shorten_amazon_title(title: str, max_words: int = 8) -> str:
 
 
 async def _ai_short_title(product_title: str, original_message: str) -> str | None:
-    """
-    Async AI title generation — uses aiohttp (non-blocking).
-    Falls back to None if OPENAI_API_KEY not set or request fails.
-    """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
     try:
         prompt = (
             "You are a deals bot for an Indian Telegram channel. "
-            "Given an Amazon product title, create a SHORT catchy deal headline in English don not mention price "
-            "Use fire/urgency emojis. "
-            "Examples: '🔥 boAt Earbuds .....' or '⚡ Sony TV 55....\" — Best Price Ever!'\n\n"
+            "Given an Amazon product title, create a SHORT catchy deal headline in Hinglish "
+            "(max 10 words). Use fire/urgency emojis. "
+            "Examples: '🔥 boAt Earbuds — Sirf ₹699!' or '⚡ Sony TV 55\" — Best Price Ever!'\n\n"
             "Return ONLY the headline. No explanation, no JSON."
         )
         context_msg = (
@@ -114,75 +99,11 @@ async def _ai_short_title(product_title: str, original_message: str) -> str | No
         return None
 
 
-async def _ai_title_and_price(
-    message_text: str, title: str, scraped_text: str, platform: str
-) -> tuple:
-    """Async AI title+price extraction — uses aiohttp (non-blocking)."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None, None
-    try:
-        context_msg = (
-            f"Platform: {platform}\n"
-            f"Message: {message_text[:300]}\n"
-            f"Product Title: {title[:200]}\n"
-            f"Product Details: {scraped_text[:400]}"
-        )
-        prompt = (
-            "You are a deals bot assistant for an Indian Telegram channel. "
-            "Given product info, return a JSON with exactly 2 keys:\n"
-            "1. 'title': A short urgent deal headline in English "
-            "Use fire/urgency emojis. Example: '🔥 boAt Earbuds — buy now ... 🏃'\n"
-            "2. 'price': Extract the price as '₹NUMBER' format. "
-            "If price not found, return null.\n\n"
-            "Return ONLY valid JSON. Example:\n"
-            '{"title": "🔥 Sony Headphones — ₹1299 mein! Limited Stock ⚡", "price": "₹1299"}'
-        )
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user",   "content": context_msg},
-            ],
-            "max_tokens": 80,
-            "temperature": 0.4,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-        }
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                "https://api.openai.com/v1/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    raw  = data["choices"][0]["message"]["content"].strip()
-                    raw  = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
-                    parsed = json.loads(raw)
-                    return parsed.get("title"), parsed.get("price")
-    except Exception:
-        return None, None
-
-
 async def build_amazon_caption(
     product: dict,
     short_link: str,
     original_message: str = "",
 ) -> str:
-    """
-    Build a rich HTML caption for an Amazon product.
-
-    Title priority:
-      1. AI-generated short Hinglish headline  (best)
-      2. First 8 words of Amazon title + "..."  (fallback, still short)
-      3. "🔥 Hot Deal!"                         (last resort)
-
-    This ensures title is NEVER the full 50-word Amazon title.
-    """
     title        = product.get("title", "").strip()
     actual_price = product.get("actual_price", "").strip()
     deal_price   = product.get("deal_price", "").strip()
@@ -191,7 +112,6 @@ async def build_amazon_caption(
     rating       = product.get("rating", "").strip()
     review_count = product.get("review_count", "").strip()
 
-    # Try AI first; fallback to shortened Amazon title (never full long title)
     ai_title = await _ai_short_title(title, original_message) if title else None
     display_title = ai_title or _shorten_amazon_title(title) or "🔥 Hot Deal!"
 
@@ -230,39 +150,4 @@ async def build_amazon_caption(
         lines.append("🛒 <b>Buy Now</b> (link unavailable)")
 
     caption = "\n".join(lines)
-
-    # Truncate based on VISIBLE text length (Telegram limit = 1024 visible chars for captions)
     return _safe_truncate(caption, max_visible=1020)
-
-
-def build_caption(
-    content: str,
-    platform: str,
-    title: str = "",
-    scraped_text: str = "",
-    scraped_price: str = "",
-    single_link: bool = True,
-) -> str:
-    emoji = PLATFORM_EMOJIS.get(platform, "🔥")
-
-    body = content.strip()
-    body = "\n".join(line.strip() for line in body.splitlines() if line.strip())
-
-    if single_link:
-        price = scraped_price or _extract_price_from_text(content)
-
-        lines = []
-        if price:
-            lines.append(f"💰 Price — {price}")
-            lines.append("")
-        lines.append(body)
-        if platform and platform != "Other":
-            lines.append(f"\n🏪 From {platform}")
-        return "\n".join(lines)
-
-    header = (
-        f"{emoji} <b>{platform} Deals</b>\n\n"
-        if platform and platform != "Other"
-        else "🔥 <b>Hot Deals!</b>\n\n"
-    )
-    return header + body
