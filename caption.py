@@ -2,7 +2,7 @@ import os
 import re
 import json
 import urllib.parse
-import openai
+import aiohttp
 
 ASSOCIATE_TAG = os.getenv("PARTNER_TAG", "dealskoti-21")
 
@@ -11,6 +11,8 @@ PRICE_REGEX = re.compile(
     r"|(\d[\d,]*(?:\.\d{1,2})?)\s*(?:₹|Rs\.?|INR)",
     re.IGNORECASE,
 )
+
+_TAG_RE = re.compile(r"<[^>]+>")
 
 PLATFORM_EMOJIS = {
     "Amazon":           "🛒",
@@ -35,12 +37,32 @@ def _extract_price_from_text(text: str) -> str:
     return ""
 
 
-def _ai_short_title(product_title: str, original_message: str) -> str | None:
+def _visible_len(html_text: str) -> int:
+    """Telegram caption limit counts visible characters, not HTML tags."""
+    return len(_TAG_RE.sub("", html_text))
+
+
+def _safe_truncate(html_text: str, max_visible: int = 1020) -> str:
+    """
+    Truncate caption so visible text <= max_visible chars.
+    If it's already within limit, return as-is.
+    If over limit, strip all HTML tags and truncate plain text.
+    """
+    if _visible_len(html_text) <= max_visible:
+        return html_text
+    plain = _TAG_RE.sub("", html_text)
+    return plain[:max_visible - 3] + "..."
+
+
+async def _ai_short_title(product_title: str, original_message: str) -> str | None:
+    """
+    Async AI title generation — uses aiohttp (non-blocking).
+    Falls back to None if OPENAI_API_KEY not set or request fails.
+    """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
     try:
-        client = openai.OpenAI(api_key=api_key)
         prompt = (
             "You are a deals bot for an Indian Telegram channel. "
             "Given an Amazon product title, create a SHORT catchy deal headline in Hinglish "
@@ -48,31 +70,47 @@ def _ai_short_title(product_title: str, original_message: str) -> str | None:
             "Examples: '🔥 boAt Earbuds — Sirf ₹699!' or '⚡ Sony TV 55\" — Best Price Ever!'\n\n"
             "Return ONLY the headline. No explanation, no JSON."
         )
-        context = f"Product Title: {product_title[:200]}\nOriginal Message: {original_message[:200]}"
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user",   "content": context},
-            ],
-            max_tokens=60,
-            temperature=0.5,
+        context_msg = (
+            f"Product Title: {product_title[:200]}\n"
+            f"Original Message: {original_message[:200]}"
         )
-        result = resp.choices[0].message.content.strip()
-        return result if result else None
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user",   "content": context_msg},
+            ],
+            "max_tokens": 60,
+            "temperature": 0.5,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status == 200:
+                    data   = await resp.json()
+                    result = data["choices"][0]["message"]["content"].strip()
+                    return result if result else None
     except Exception:
         return None
 
 
-def _ai_title_and_price(
+async def _ai_title_and_price(
     message_text: str, title: str, scraped_text: str, platform: str
 ) -> tuple:
+    """Async AI title+price extraction — uses aiohttp (non-blocking)."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None, None
     try:
-        client = openai.OpenAI(api_key=api_key)
-        context = (
+        context_msg = (
             f"Platform: {platform}\n"
             f"Message: {message_text[:300]}\n"
             f"Product Title: {title[:200]}\n"
@@ -88,28 +126,45 @@ def _ai_title_and_price(
             "Return ONLY valid JSON. Example:\n"
             '{"title": "🔥 Sony Headphones — ₹1299 mein! Limited Stock ⚡", "price": "₹1299"}'
         )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user",   "content": context},
+                {"role": "user",   "content": context_msg},
             ],
-            max_tokens=80,
-            temperature=0.4,
-        )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
-        data = json.loads(raw)
-        return data.get("title"), data.get("price")
+            "max_tokens": 80,
+            "temperature": 0.4,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    raw  = data["choices"][0]["message"]["content"].strip()
+                    raw  = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
+                    parsed = json.loads(raw)
+                    return parsed.get("title"), parsed.get("price")
     except Exception:
         return None, None
 
 
-def build_amazon_caption(
+async def build_amazon_caption(
     product: dict,
     short_link: str,
     original_message: str = "",
 ) -> str:
+    """
+    Build a rich HTML caption for an Amazon product.
+    Now async so the AI title call doesn't block the event loop.
+    """
     title        = product.get("title", "").strip()
     actual_price = product.get("actual_price", "").strip()
     deal_price   = product.get("deal_price", "").strip()
@@ -118,7 +173,7 @@ def build_amazon_caption(
     rating       = product.get("rating", "").strip()
     review_count = product.get("review_count", "").strip()
 
-    ai_title = _ai_short_title(title, original_message) if title else None
+    ai_title      = await _ai_short_title(title, original_message) if title else None
     display_title = ai_title or (f"🔥 {title}" if title else "🔥 Hot Deal!")
 
     lines = []
@@ -154,10 +209,8 @@ def build_amazon_caption(
 
     caption = "\n".join(lines)
 
-    if len(caption) > 1024:
-        caption = caption[:1020] + "..."
-
-    return caption
+    # Truncate based on VISIBLE text length (Telegram limit = 1024 visible chars for captions)
+    return _safe_truncate(caption, max_visible=1020)
 
 
 def build_caption(
@@ -175,14 +228,8 @@ def build_caption(
 
     if single_link:
         price = scraped_price or _extract_price_from_text(content)
-        ai_title, ai_price = _ai_title_and_price(content, title, scraped_text, platform)
-        if not price and ai_price:
-            price = ai_price
 
         lines = []
-        if ai_title:
-            lines.append(ai_title)
-            lines.append("")
         if price:
             lines.append(f"💰 Price — {price}")
             lines.append("")
