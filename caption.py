@@ -4,8 +4,6 @@ import json
 import urllib.parse
 import aiohttp
 
-ASSOCIATE_TAG = os.getenv("PARTNER_TAG", "dealskoti-21")
-
 PRICE_REGEX = re.compile(
     r"(?:₹|Rs\.?|INR)\s*(\d[\d,]*(?:\.\d{1,2})?)"
     r"|(\d[\d,]*(?:\.\d{1,2})?)\s*(?:₹|Rs\.?|INR)",
@@ -52,6 +50,20 @@ def _safe_truncate(html_text: str, max_visible: int = 1020) -> str:
         return html_text
     plain = _TAG_RE.sub("", html_text)
     return plain[:max_visible - 3] + "..."
+
+
+def _shorten_amazon_title(title: str, max_words: int = 8) -> str:
+    """
+    Amazon titles bahut lambe hote hain (50+ words).
+    Pehle max_words words lo — short aur readable rahega.
+    Agar title pehle se chhota hai toh as-is return karo.
+    """
+    if not title:
+        return ""
+    words = title.split()
+    if len(words) <= max_words:
+        return f"🔥 {title}"
+    return f"🔥 {' '.join(words[:max_words])}..."
 
 
 async def _ai_short_title(product_title: str, original_message: str) -> str | None:
@@ -163,7 +175,13 @@ async def build_amazon_caption(
 ) -> str:
     """
     Build a rich HTML caption for an Amazon product.
-    Now async so the AI title call doesn't block the event loop.
+
+    Title priority:
+      1. AI-generated short Hinglish headline  (best)
+      2. First 8 words of Amazon title + "..."  (fallback, still short)
+      3. "🔥 Hot Deal!"                         (last resort)
+
+    This ensures title is NEVER the full 50-word Amazon title.
     """
     title        = product.get("title", "").strip()
     actual_price = product.get("actual_price", "").strip()
@@ -173,8 +191,9 @@ async def build_amazon_caption(
     rating       = product.get("rating", "").strip()
     review_count = product.get("review_count", "").strip()
 
-    ai_title      = await _ai_short_title(title, original_message) if title else None
-    display_title = ai_title or (f"🔥 {title}" if title else "🔥 Hot Deal!")
+    # Try AI first; fallback to shortened Amazon title (never full long title)
+    ai_title = await _ai_short_title(title, original_message) if title else None
+    display_title = ai_title or _shorten_amazon_title(title) or "🔥 Hot Deal!"
 
     lines = []
     lines.append("🙏Jai Shree Ram Dosto🙏")
@@ -183,7 +202,7 @@ async def build_amazon_caption(
     lines.append("")
 
     if actual_price and deal_price and actual_price != deal_price:
-        lines.append(f"💰 Actual Price:      <s>{actual_price}</s>")
+        lines.append(f"💰 MRP:               <s>{actual_price}</s>")
         lines.append(f"🏷️ Deal Price:        <b>{deal_price}</b>")
         if savings:
             lines.append(f"💵 You Save:         <b>{savings}</b>")
