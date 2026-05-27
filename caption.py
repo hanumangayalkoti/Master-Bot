@@ -77,9 +77,9 @@ async def _ai_short_title(product_title: str, original_message: str) -> str | No
     try:
         prompt = (
             "You are a deals bot for an Indian Telegram channel. "
-            "Given an Amazon product title, create a SHORT catchy deal headline in Hinglish "
-            "(max 10 words). Use fire/urgency emojis. "
-            "Examples: '🔥 boAt Earbuds — Sirf ₹699!' or '⚡ Sony TV 55\" — Best Price Ever!'\n\n"
+            "Given an Amazon product title, create a SHORT catchy deal headline in English don not mention price "
+            "Use fire/urgency emojis. "
+            "Examples: '🔥 boAt Earbuds .....' or '⚡ Sony TV 55....\" — Best Price Ever!'\n\n"
             "Return ONLY the headline. No explanation, no JSON."
         )
         context_msg = (
@@ -131,8 +131,8 @@ async def _ai_title_and_price(
         prompt = (
             "You are a deals bot assistant for an Indian Telegram channel. "
             "Given product info, return a JSON with exactly 2 keys:\n"
-            "1. 'title': A short urgent deal headline in Hinglish (max 12 words). "
-            "Use fire/urgency emojis. Example: '🔥 boAt Earbuds — Sirf ₹699! Abhi Khareed lo 🏃'\n"
+            "1. 'title': A short urgent deal headline in English "
+            "Use fire/urgency emojis. Example: '🔥 boAt Earbuds — buy now ... 🏃'\n"
             "2. 'price': Extract the price as '₹NUMBER' format. "
             "If price not found, return null.\n\n"
             "Return ONLY valid JSON. Example:\n"
