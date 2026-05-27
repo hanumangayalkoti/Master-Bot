@@ -3,6 +3,7 @@ import re
 import html as html_lib
 import json
 import logging
+import urllib.parse
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton
 )
@@ -731,7 +732,19 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await wait_msg.delete()
 
-        detect_text = ((product.get("title", "") + " ") if product else "") + raw_plain
+        # When API fails, extract product words from Amazon URL slug
+        # e.g. /Calvin-Klein-Regular-Shirt/dp/B08X → "Calvin Klein Regular Shirt"
+        url_slug_words = ""
+        if not product:
+            try:
+                parsed_path = urllib.parse.urlparse(amazon_url).path
+                slug_parts  = [p for p in parsed_path.split("/")
+                               if p and p.lower() != "dp"
+                               and not re.fullmatch(r"[A-Za-z0-9]{10}", p)]
+                url_slug_words = " ".join(slug_parts).replace("-", " ") + " "
+            except Exception:
+                pass
+        detect_text = ((product.get("title", "") + " ") if product else url_slug_words) + raw_plain
         try:
             result   = await detect_category(detect_text)
             category, method, ai_error, matched_kws = (list(result) + [None, None, None, None])[:4]
