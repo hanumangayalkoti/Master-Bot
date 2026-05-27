@@ -4,8 +4,7 @@ import json
 import urllib.parse
 import openai
 
-ASSOCIATE_TAG   = "dealskoti-21"
-URL_REGEX       = r"(https?://[^\s\]\[<>\"']+)"
+ASSOCIATE_TAG = os.getenv("PARTNER_TAG", "dealskoti-21")
 
 PRICE_REGEX = re.compile(
     r"(?:₹|Rs\.?|INR)\s*(\d[\d,]*(?:\.\d{1,2})?)"
@@ -34,6 +33,35 @@ def _extract_price_from_text(text: str) -> str:
     if m:
         return f"₹{m.group(1) or m.group(2)}"
     return ""
+
+
+def _ai_short_title(product_title: str, original_message: str) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        prompt = (
+            "You are a deals bot for an Indian Telegram channel. "
+            "Given an Amazon product title, create a SHORT catchy deal headline in Hinglish "
+            "(max 10 words). Use fire/urgency emojis. "
+            "Examples: '🔥 boAt Earbuds — Sirf ₹699!' or '⚡ Sony TV 55\" — Best Price Ever!'\n\n"
+            "Return ONLY the headline. No explanation, no JSON."
+        )
+        context = f"Product Title: {product_title[:200]}\nOriginal Message: {original_message[:200]}"
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user",   "content": context},
+            ],
+            max_tokens=60,
+            temperature=0.5,
+        )
+        result = resp.choices[0].message.content.strip()
+        return result if result else None
+    except Exception:
+        return None
 
 
 def _ai_title_and_price(
@@ -77,50 +105,33 @@ def _ai_title_and_price(
         return None, None
 
 
-# =============================================================================
-# AMAZON CAPTION — API data se rich format
-# =============================================================================
 def build_amazon_caption(
     product: dict,
     short_link: str,
     original_message: str = "",
 ) -> str:
-    """
-    Amazon PA API product dict se caption banao.
-    Format:
-      🙏Jai Shree Ram Dosto🙏
-
-      🔥 [Title]
-
-      💰 Actual Price:    ₹X,XXX
-      🏷️ Discounted Price: ₹X,XXX
-      📉 Discount:         XX% OFF
-
-      🛒 Buy Now → [short link]
-    """
     title        = product.get("title", "").strip()
     actual_price = product.get("actual_price", "").strip()
     deal_price   = product.get("deal_price", "").strip()
     discount_pct = product.get("discount_pct", 0)
+    savings      = product.get("savings", "").strip()
     rating       = product.get("rating", "").strip()
     review_count = product.get("review_count", "").strip()
 
-    # Title — AI se catchy banao ya as-is raho
-    if original_message:
-        ai_title, _ = _ai_title_and_price(original_message, title, "", "Amazon")
-        display_title = ai_title or (f"🔥 {title}" if title else "🔥 Hot Deal!")
-    else:
-        display_title = f"🔥 {title}" if title else "🔥 Hot Deal!"
+    ai_title = _ai_short_title(title, original_message) if title else None
+    display_title = ai_title or (f"🔥 {title}" if title else "🔥 Hot Deal!")
 
     lines = []
     lines.append("🙏Jai Shree Ram Dosto🙏")
     lines.append("")
-    lines.append(display_title)
+    lines.append(f"<b>{display_title}</b>")
     lines.append("")
 
     if actual_price and deal_price and actual_price != deal_price:
         lines.append(f"💰 Actual Price:      <s>{actual_price}</s>")
-        lines.append(f"🏷️ Discounted Price: <b>{deal_price}</b>")
+        lines.append(f"🏷️ Deal Price:        <b>{deal_price}</b>")
+        if savings:
+            lines.append(f"💵 You Save:         <b>{savings}</b>")
     elif deal_price:
         lines.append(f"🏷️ Price: <b>{deal_price}</b>")
     elif actual_price:
@@ -129,27 +140,26 @@ def build_amazon_caption(
     if discount_pct and int(discount_pct) > 0:
         lines.append(f"📉 Discount:          <b>{discount_pct}% OFF</b>")
 
-    if rating:
-        rating_line = f"⭐ Rating: {rating}/5"
+    if rating or review_count:
+        rating_line = ""
+        if rating:
+            rating_line = f"⭐ Rating: <b>{rating}/5</b>"
         if review_count:
-            rating_line += f" ({review_count} reviews)"
-        lines.append(rating_line)
+            rating_line += f"  |  👥 <b>{review_count}</b> reviews"
+        if rating_line:
+            lines.append(rating_line)
 
     lines.append("")
-    lines.append(f"🛒 <b><a href=\"{short_link}\">Buy Now →</a></b>")
+    lines.append(f'🛒 <b><a href="{short_link}">Buy Now →</a></b>')
 
     caption = "\n".join(lines)
 
-    # Telegram caption limit 1024 chars
     if len(caption) > 1024:
         caption = caption[:1020] + "..."
 
     return caption
 
 
-# =============================================================================
-# EXISTING CAPTION — non-Amazon ya fallback ke liye
-# =============================================================================
 def build_caption(
     content: str,
     platform: str,
