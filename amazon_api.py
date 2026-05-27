@@ -60,18 +60,32 @@ async def _get_token() -> str | None:
         logger.error(f"Unsupported CREDENTIAL_VERSION: {CREDENTIAL_VERSION}")
         return None
 
+    # v3.x (LWA) → JSON body  |  v2.x (Cognito) → form-encoded
+    # Source: Amazon Creators API SDK oauth2_token_manager.py
+    is_lwa = CREDENTIAL_VERSION.startswith("3.")
+    token_payload = {
+        "grant_type":    "client_credentials",
+        "client_id":     CREDENTIAL_ID,
+        "client_secret": CREDENTIAL_SECRET,
+        "scope":         SCOPE,
+    }
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                token_url,
-                data={
-                    "grant_type":    "client_credentials",
-                    "client_id":     CREDENTIAL_ID,
-                    "client_secret": CREDENTIAL_SECRET,
-                    "scope":         SCOPE,
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
+            if is_lwa:
+                req = session.post(
+                    token_url,
+                    json=token_payload,                          # LWA needs JSON
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                )
+            else:
+                req = session.post(
+                    token_url,
+                    data=token_payload,                          # Cognito needs form-encoded
+                    timeout=aiohttp.ClientTimeout(total=15),
+                )
+            async with req as resp:
                 if resp.status == 200:
                     data       = await resp.json()
                     token      = data.get("access_token")
