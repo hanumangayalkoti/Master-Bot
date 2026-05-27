@@ -224,7 +224,10 @@ async def build_amazon_caption(
             lines.append(rating_line)
 
     lines.append("")
-    lines.append(f'🛒 <b><a href="{short_link}">Buy Now →</a></b>')
+    if short_link:
+        lines.append(f'🛒 <b><a href="{short_link}">Buy Now →</a></b>')
+    else:
+        lines.append("🛒 <b>Buy Now</b> (link unavailable)")
 
     caption = "\n".join(lines)
 
