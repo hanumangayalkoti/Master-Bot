@@ -36,11 +36,11 @@ _token_cache: dict = {"token": None, "expires_at": None}
 
 PRODUCT_RESOURCES = [
     "images.primary.large",
+    "images.primary.medium",
     "itemInfo.title",
     "offersV2.listings.price",
     "offersV2.listings.availability",
-    "offersV2.listings.dealDetails",
-    "offersV2.listings.programEligibility",
+    "offersV2.listings.condition",
     "customerReviews.count",
     "customerReviews.starRating",
 ]
