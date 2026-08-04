@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
         "btn1": {"label": "Join Channel", "url": "", "enabled": False},
         "btn2": {"label": "More Deals",   "url": "", "enabled": False},
     },
+    "watermark": {"enabled": False, "text": ""},
 }
 
 
@@ -94,8 +95,9 @@ def load_config() -> dict:
                 row = cur.fetchone()
         if row:
             cfg = json.loads(row[0])
-            cfg.setdefault("groups", [])
-            cfg.setdefault("buttons", DEFAULT_CONFIG["buttons"].copy())
+            cfg.setdefault("groups",    [])
+            cfg.setdefault("buttons",   DEFAULT_CONFIG["buttons"].copy())
+            cfg.setdefault("watermark", DEFAULT_CONFIG["watermark"].copy())
             return cfg
     except Exception as e:
         logger.error(f"Config load error: {e}")
@@ -105,6 +107,7 @@ def load_config() -> dict:
             "btn1": {"label": "Join Channel", "url": "", "enabled": False},
             "btn2": {"label": "More Deals",   "url": "", "enabled": False},
         },
+        "watermark": {"enabled": False, "text": ""},
     }
 
 
