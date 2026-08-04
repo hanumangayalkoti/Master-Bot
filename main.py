@@ -85,9 +85,11 @@ PRODUCT_RESOURCES = [
     "images.primary.large",
     "images.primary.medium",
     "itemInfo.title",
+    "itemInfo.byLineInfo",
     "offersV2.listings.price",
     "offersV2.listings.availability",
     "offersV2.listings.condition",
+    "offersV2.listings.deliveryInfo",
     "customerReviews.count",
     "customerReviews.starRating",
 ]
@@ -434,6 +436,11 @@ def _parse_item(item: dict) -> dict:
     title_data      = item.get("itemInfo", {}).get("title", {})
     result["title"] = (title_data.get("displayValue", "") if title_data else "").strip()
 
+    # Brand
+    by_line = item.get("itemInfo", {}).get("byLineInfo", {})
+    brand_obj = by_line.get("brand", {}) if by_line else {}
+    result["brand"] = (brand_obj.get("displayValue", "") or "").strip() if brand_obj else ""
+
     img_primary         = item.get("images", {}).get("primary", {})
     img                 = img_primary.get("large") or img_primary.get("medium") or img_primary.get("small") or {}
     result["image_url"] = img.get("url", "") if img else ""
@@ -444,6 +451,7 @@ def _parse_item(item: dict) -> dict:
     result["actual_amount"] = 0.0
     result["discount_pct"]  = 0
     result["savings"]       = ""
+    result["is_prime"]      = False
 
     listings = item.get("offersV2", {}).get("listings", [])
     if listings:
@@ -474,6 +482,11 @@ def _parse_item(item: dict) -> dict:
                 )
             except Exception:
                 pass
+
+        # Prime eligibility
+        delivery = listing.get("deliveryInfo", {})
+        if delivery:
+            result["is_prime"] = bool(delivery.get("isPrimeEligible", False))
 
     cr                     = item.get("customerReviews", {})
     star                   = cr.get("starRating", {})
@@ -571,7 +584,7 @@ def _apply_watermark(image_bytes: bytes, text: str) -> bytes:
     try:
         from PIL import Image, ImageDraw, ImageFont
         img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        font_size = max(14, img.width // 28)
+        font_size = max(20, img.width // 16)
         try:
             font = ImageFont.truetype(
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
@@ -645,37 +658,47 @@ def _truncate_caption(text: str, max_len: int = 1020) -> str:
 # =============================================================================
 def build_amazon_caption(product: dict, short_link: str) -> str:
     title        = product.get("title", "")
+    brand        = product.get("brand", "")
     deal_price   = product.get("deal_price", "")
     actual_price = product.get("actual_price", "")
     discount     = product.get("discount_pct", 0)
-    savings      = product.get("savings", "")
     rating       = product.get("rating", "")
     reviews      = product.get("review_count", "")
+    is_prime     = product.get("is_prime", False)
 
     lines = ["🙏Jai Shree Ram Dosto🙏\n"]
 
+    if brand:
+        lines.append(f"🏷 <b>{html_lib.escape(brand)}</b>")
+
     if title:
-        lines.append(f"<b>{html_lib.escape(title)}</b>\n")
+        lines.append(f"<b>{html_lib.escape(title)}</b>")
+
+    lines.append("")
+
+    if actual_price:
+        lines.append(f"🏷️ MRP: <s>{html_lib.escape(actual_price)}</s>")
 
     if deal_price:
-        price_line = f"💰 <b>Price: {html_lib.escape(deal_price)}</b>"
-        if actual_price and discount:
-            price_line += f"  <s>{html_lib.escape(actual_price)}</s>  🔥 {discount}% OFF"
-        elif actual_price:
-            price_line += f"  <s>{html_lib.escape(actual_price)}</s>"
-        lines.append(price_line)
+        lines.append(f"💰 Buy at: <b>{html_lib.escape(deal_price)}</b>")
 
-    if savings:
-        lines.append(f"💵 Bachao: <b>{html_lib.escape(savings)}</b>")
+    try:
+        disc = int(discount)
+    except (ValueError, TypeError):
+        disc = 0
+    if disc > 0:
+        lines.append(f"🎯 Discount: <b>{disc}% OFF</b>")
 
     if rating or reviews:
-        star_line = ""
+        star_line = "⭐ "
         if rating:
-            star_line += f"⭐ {html_lib.escape(str(rating))}/5"
+            star_line += f"<b>{html_lib.escape(str(rating))}/5</b>"
         if reviews:
-            star_line += f"  ({html_lib.escape(str(reviews))} reviews)"
-        if star_line:
-            lines.append(star_line)
+            star_line += f" ({html_lib.escape(str(reviews))} Ratings)"
+        lines.append(star_line)
+
+    if is_prime:
+        lines.append("🚚 <b>Prime Eligible</b>")
 
     lines.append(f'\n🔗 <b><a href="{html_lib.escape(short_link)}">{html_lib.escape(short_link)}</a></b>')
     return _truncate_caption("\n".join(lines), 1020)
@@ -1857,4 +1880,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
