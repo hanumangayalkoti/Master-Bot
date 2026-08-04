@@ -172,7 +172,7 @@ def build_amazon_caption(product: dict, short_link: str) -> str:
         if star_line:
             lines.append(star_line)
 
-    lines.append(f'\n🛒 <a href="{html_lib.escape(short_link)}">Buy Now — Amazon.in</a>')
+    lines.append(f'\n🔗 <b><a href="{html_lib.escape(short_link)}">{html_lib.escape(short_link)}</a></b>')
     return _truncate_caption("\n".join(lines), 1020)
 
 
@@ -746,7 +746,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amazon_url = amazon_urls[0]
 
         resolved_url = amazon_url
-        if "amzn.to" in amazon_url or "amzn.in" in amazon_url:
+        if "amzn.to" in amazon_url or "amzn.in" in amazon_url or "link.amazon.com" in amazon_url or "link.amazon.in" in amazon_url:
             resolved_url = await _resolve_redirect(amazon_url)
 
         if is_amazon_search_url(resolved_url):
