@@ -286,7 +286,7 @@ async def get_product_by_asin(asin: str) -> dict | None:
 
 async def enrich_amazon_url(url: str) -> dict | None:
     resolved = url
-    if "amzn.to" in url or "amzn.in" in url:
+    if "amzn.to" in url or "amzn.in" in url or "link.amazon.com" in url or "link.amazon.in" in url:
         resolved = await _resolve_redirect(url)
 
     asin = extract_asin(resolved)
