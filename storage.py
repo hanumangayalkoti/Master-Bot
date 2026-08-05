@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 DEFAULT_CONFIG = {
-    "groups": [],
+    "channel": "",
     "buttons": {
         "btn1": {"label": "Join Channel", "url": "", "enabled": False},
         "btn2": {"label": "More Deals",   "url": "", "enabled": False},
@@ -41,23 +41,8 @@ def get_db():
         conn.close()
 
 
-def _migrate_button_keys(config: dict) -> tuple:
-    """Migrate old 'b1'/'b2' button keys to 'btn1'/'btn2'."""
-    buttons = config.get("buttons", {})
-    changed = False
-    for old, new in [("b1", "btn1"), ("b2", "btn2")]:
-        if old in buttons:
-            if new not in buttons:
-                buttons[new] = buttons.pop(old)
-            else:
-                buttons.pop(old)
-            changed = True
-    config["buttons"] = buttons
-    return config, changed
-
-
 def init_db():
-    """Create tables on first run and migrate old button keys."""
+    """Create tables on first run."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -74,16 +59,6 @@ def init_db():
             """)
     logger.info("Database tables ready.")
 
-    # Migrate old b1/b2 button keys if needed
-    try:
-        cfg = load_config()
-        cfg, changed = _migrate_button_keys(cfg)
-        if changed:
-            save_config(cfg)
-            logger.info("Button keys migrated b1/b2 → btn1/btn2.")
-    except Exception as e:
-        logger.error(f"Migration error: {e}")
-
 
 def load_config() -> dict:
     """Load bot config from PostgreSQL. Returns default if not found."""
@@ -94,13 +69,13 @@ def load_config() -> dict:
                 row = cur.fetchone()
         if row:
             cfg = json.loads(row[0])
-            cfg.setdefault("groups", [])
+            cfg.setdefault("channel", "")
             cfg.setdefault("buttons", DEFAULT_CONFIG["buttons"].copy())
             return cfg
     except Exception as e:
         logger.error(f"Config load error: {e}")
     return {
-        "groups": [],
+        "channel": "",
         "buttons": {
             "btn1": {"label": "Join Channel", "url": "", "enabled": False},
             "btn2": {"label": "More Deals",   "url": "", "enabled": False},
