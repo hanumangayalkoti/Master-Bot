@@ -10,7 +10,6 @@ from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
     CallbackQueryHandler, filters, ContextTypes
 )
-from classifier import detect_category
 from amazon_api import (
     is_amazon_url, is_amazon_search_url, enrich_amazon_url,
     get_short_affiliate_link, _resolve_redirect,
@@ -31,8 +30,6 @@ try:
 except ValueError:
     ADMIN_ID = 0
     logger.error("ADMIN_ID env var must be a number!")
-
-ALL_CATS = ["fitness", "fashion", "electronics", "home", "skincare"]
 
 URL_REGEX = re.compile(r"(https?://[^\s\]\[<>\"']+)")
 
@@ -170,120 +167,8 @@ def entities_to_html(text: str, entities: list) -> str:
 
 
 # =============================================================================
-# ADMIN REPLY HELPERS
+# SETBUTTON UI HELPERS
 # =============================================================================
-def _channel_html_link(channel: str) -> str:
-    ch = channel.strip()
-    if ch.startswith("@"):
-        name = ch[1:]
-        return f'<a href="https://t.me/{name}">{ch}</a>'
-    return f"<code>{ch}</code>"
-
-
-async def _send_admin_reply(
-    msg,
-    headline: str,
-    category: str | None = None,
-    method: str | None   = None,
-    matched_kws: list    = None,
-    ai_error: str | None = None,
-    sent_channels: list  = None,
-    errors: list         = None,
-    extra_line: str      = "",
-):
-    cat_emojis = {
-        "electronics": "⚡", "fashion": "👗",
-        "fitness": "💪", "skincare": "✨", "home": "🏠",
-    }
-    cat_emoji    = cat_emojis.get(category, "🏷️") if category else ""
-    method_emoji = "🤖" if method == "AI" else ("🔑" if method else "")
-    kw_line      = ""
-    if method == "Keyword" and matched_kws:
-        kw_line = f"\n🔍 Matched: {', '.join(matched_kws[:5])}"
-
-    lines = [headline]
-
-    if category:
-        lines.append(f"{cat_emoji} Category: <b>{category.capitalize()}</b> {method_emoji}{kw_line}")
-
-    if extra_line:
-        lines.append(extra_line)
-
-    if sent_channels:
-        lines.append("")
-        lines.append("📢 <b>Post kiya:</b>")
-        for ch in sent_channels:
-            lines.append(f"  • {_channel_html_link(ch)}")
-    elif sent_channels is not None:
-        lines.append("")
-        lines.append(
-            "⚠️ Koi channel nahi mila! Is category ke liye koi enabled channel nahi hai.\n"
-            "/editgroup se channels set karo."
-        )
-
-    if ai_error:
-        lines.append(f"\n⚠️ AI Error: <code>{html_lib.escape(str(ai_error))}</code>")
-    if errors:
-        lines.append("\n❌ <b>Errors:</b>")
-        for err in errors:
-            lines.append(f"  • {html_lib.escape(str(err))}")
-
-    text = "\n".join(lines)
-    await msg.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
-
-
-# =============================================================================
-# UI HELPERS
-# =============================================================================
-def _toggle_keyboard(groups):
-    buttons = []
-    for i, g in enumerate(groups):
-        status = "✅ ON" if g.get("enabled", True) else "❌ OFF"
-        buttons.append([InlineKeyboardButton(
-            f"{status} — {g.get('name', 'Group')}",
-            callback_data=f"toggle_{i}"
-        )])
-    buttons.append([InlineKeyboardButton("💾 Save & Done", callback_data="toggle_done")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def _group_select_kb(prefix):
-    config = load_config()
-    buttons = []
-    for i, g in enumerate(config.get("groups", [])):
-        buttons.append([InlineKeyboardButton(
-            g.get("name", f"Group {i+1}"),
-            callback_data=f"{prefix}_{i}"
-        )])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def _cat_toggle_kb(selected, done_cb):
-    buttons = []
-    for cat in ALL_CATS:
-        tick = "✅" if cat in selected else "⬜"
-        buttons.append([InlineKeyboardButton(
-            f"{tick} {cat.capitalize()}",
-            callback_data=f"cat_{cat}"
-        )])
-    buttons.append([InlineKeyboardButton("💾 Done", callback_data=done_cb)])
-    return InlineKeyboardMarkup(buttons)
-
-
-def _channel_select_kb(group_idx, prefix):
-    config  = load_config()
-    groups  = config.get("groups", [])
-    if group_idx >= len(groups):
-        return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
-    buttons = []
-    for j, ch_obj in enumerate(groups[group_idx].get("channels", [])):
-        ch = ch_obj.get("channel", f"Channel {j+1}")
-        buttons.append([InlineKeyboardButton(ch, callback_data=f"{prefix}_{group_idx}_{j}")])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-    return InlineKeyboardMarkup(buttons)
-
-
 def _setbutton_status_text(buttons: dict) -> str:
     b1 = buttons.get("btn1", {})
     b2 = buttons.get("btn2", {})
@@ -304,7 +189,6 @@ def _setbutton_status_text(buttons: dict) -> str:
 
 
 def _setbutton_main_kb(buttons: dict) -> InlineKeyboardMarkup:
-    """Main /setbutton keyboard — shows actual button names."""
     b1_label = buttons.get("btn1", {}).get("label", "Button 1")
     b2_label = buttons.get("btn2", {}).get("label", "Button 2")
     return InlineKeyboardMarkup([
@@ -317,10 +201,10 @@ def _setbutton_main_kb(buttons: dict) -> InlineKeyboardMarkup:
 def _setbutton_detail_kb(btn_key: str, btn: dict) -> InlineKeyboardMarkup:
     toggle_label = "🟢 Turn ON" if not btn.get("enabled") else "🔴 Turn OFF"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Rename",      callback_data=f"sb_{btn_key}_rename")],
-        [InlineKeyboardButton("🔗 Set Link",    callback_data=f"sb_{btn_key}_link")],
-        [InlineKeyboardButton(toggle_label,     callback_data=f"sb_{btn_key}_toggle")],
-        [InlineKeyboardButton("⬅️ Back",        callback_data="sb_main")],
+        [InlineKeyboardButton("📝 Rename",   callback_data=f"sb_{btn_key}_rename")],
+        [InlineKeyboardButton("🔗 Set Link", callback_data=f"sb_{btn_key}_link")],
+        [InlineKeyboardButton(toggle_label,  callback_data=f"sb_{btn_key}_toggle")],
+        [InlineKeyboardButton("⬅️ Back",     callback_data="sb_main")],
     ])
 
 
@@ -345,40 +229,75 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 <b>DealsKoti Bot chalu hai!</b>\n\n"
-        "Deal ka message bhejo — AI category detect karke sahi channel mein post kar dega.\n\n"
+        "Deal ka message bhejo — bot automatically channel mein post kar dega.\n\n"
         "/help daao sare commands dekhne ke liye.",
         parse_mode="HTML"
     )
 
 
-async def cmd_testai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await update.message.reply_text("🔄 OpenAI API test ho rahi hai...")
-    try:
-        cat, method, err, kws = await detect_category("mamaearth face scrub for glowing skin")
-        if method == "AI":
-            await update.message.reply_text(
-                f"✅ <b>AI kaam kar raha hai!</b>\n\n"
-                f"Test: <code>mamaearth face scrub</code>\n"
-                f"Category: <b>{cat}</b>\nMethod: <b>AI 🤖</b>",
-                parse_mode="HTML"
-            )
-        else:
-            kw_str = ", ".join(f"<code>{k}</code>" for k in kws) if kws else "koi match nahi"
-            await update.message.reply_text(
-                f"❌ <b>AI kaam nahi kar raha!</b>\n\n"
-                f"Method: <b>Keyword fallback 🔑</b>\n"
-                f"Category: <b>{cat or 'detect nahi hua'}</b>\n"
-                f"Matched keywords: {kw_str}\n\n"
-                f"<b>AI Error:</b>\n<code>{html_lib.escape(str(err))}</code>",
-                parse_mode="HTML"
-            )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ <b>Exception aaya:</b>\n<code>{html_lib.escape(str(e))}</code>",
-            parse_mode="HTML"
-        )
+    await update.message.reply_text(
+        "📖 <b>DealsKoti Bot — Sare Commands</b>\n\n"
+        "📊 /status — Channel aur buttons ka status dekho\n"
+        "📢 /setchannel — Post karne wala channel set karo\n"
+        "🎛️ /setbutton — Post ke neeche buttons set karo\n"
+        "🧪 /testamz — Amazon API test karo\n"
+        "💾 /exportconfig — Config backup karo\n"
+        "ℹ️ /start — Bot ki info",
+        parse_mode="HTML"
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    config  = load_config()
+    channel = config.get("channel", "") or "Set nahi hua (/setchannel se set karo)"
+    buttons = config.get("buttons", {})
+
+    b1 = buttons.get("btn1", {})
+    b2 = buttons.get("btn2", {})
+
+    lines = [
+        "⚙️ <b>Bot Status</b>\n",
+        f"📢 <b>Channel:</b> <code>{html_lib.escape(channel)}</code>\n",
+        "🎛️ <b>Buttons:</b>",
+        f"  Button 1: {'✅ ON' if b1.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b1.get('label', '-'))}</b>",
+        f"  Button 2: {'✅ ON' if b2.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b2.get('label', '-'))}</b>",
+    ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    context.user_data.clear()
+    context.user_data["action"] = "wait_channel_id"
+    config = load_config()
+    current = config.get("channel", "") or "Set nahi hua"
+    await update.message.reply_text(
+        f"📢 <b>Channel Set Karo</b>\n\n"
+        f"Current: <code>{html_lib.escape(current)}</code>\n\n"
+        f"Naya channel ID type karo (jaise @mychannel ya -100123456789):",
+        parse_mode="HTML"
+    )
+
+
+async def cmd_setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    config  = load_config()
+    buttons = config.get("buttons", {})
+    await update.message.reply_text(
+        "🎛️ <b>Button Settings</b>\n\n"
+        + _setbutton_status_text(buttons)
+        + "\n\n<i>Kaun sa configure karna hai?</i>",
+        parse_mode="HTML",
+        reply_markup=_setbutton_main_kb(buttons)
+    )
 
 
 async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,159 +334,6 @@ async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    await update.message.reply_text(
-        "📖 <b>DealsKoti Bot — Sare Commands</b>\n\n"
-        "📊 /status — Groups, channels aur buttons dekho\n"
-        "🔁 /manage — Groups ON/OFF karo\n"
-        "✏️ /editgroup — Channel ki categories badlo\n"
-        "✏️ /rename — Group naam badlo\n"
-        "🎛️ /setbutton — Post ke neeche buttons set karo\n"
-        "➕ /addgroup — Naya group banao\n"
-        "➕ /addchannel — Group mein channel add karo\n"
-        "🗑️ /deletegroup — Group delete karo\n"
-        "🗑️ /deletechannel — Channel hatao\n"
-        "🧪 /testai — OpenAI API test karo\n"
-        "🧪 /testamz — Amazon API test karo\n"
-        "💾 /exportconfig — Config backup karo\n"
-        "ℹ️ /start — Bot ki info",
-        parse_mode="HTML"
-    )
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    config  = load_config()
-    groups  = config.get("groups", [])
-    buttons = config.get("buttons", {})
-
-    b1 = buttons.get("btn1", {})
-    b2 = buttons.get("btn2", {})
-
-    lines = [
-        "⚙️ <b>Bot Status</b>\n",
-        "🎛️ <b>Buttons:</b>",
-        f"  Button 1: {'✅ ON' if b1.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b1.get('label', '-'))}</b>",
-        f"  Button 2: {'✅ ON' if b2.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b2.get('label', '-'))}</b>",
-        "",
-    ]
-
-    if not groups:
-        lines.append("⚠️ Koi group nahi — /addgroup se banao")
-    else:
-        lines.append("📢 <b>Groups:</b>")
-        for i, g in enumerate(groups, 1):
-            st = "✅ ON" if g.get("enabled", True) else "❌ OFF"
-            lines.append(f"\n<b>{i}. {html_lib.escape(g.get('name', 'Group'))}</b> — {st}")
-            for ch_obj in g.get("channels", []):
-                cats = ", ".join(c.capitalize() for c in ch_obj.get("categories", []))
-                lines.append(f"   📢 {html_lib.escape(ch_obj.get('channel', ''))}")
-                lines.append(f"      Categories: {cats or '—'}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    groups = load_config().get("groups", [])
-    if not groups:
-        await update.message.reply_text("⚠️ Koi group nahi — /addgroup se banao")
-        return
-    await update.message.reply_text(
-        "🔁 <b>Groups ON/OFF Karo</b>\nTap karo toggle karne ke liye:",
-        reply_markup=_toggle_keyboard(groups), parse_mode="HTML"
-    )
-
-
-async def cmd_editgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not load_config().get("groups"):
-        await update.message.reply_text("⚠️ Koi group nahi — /addgroup se banao")
-        return
-    await update.message.reply_text(
-        "✏️ <b>Group Edit Karo</b>\nKaun sa group?",
-        reply_markup=_group_select_kb("eg_group"), parse_mode="HTML"
-    )
-
-
-async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not load_config().get("groups"):
-        await update.message.reply_text("⚠️ Koi group nahi.")
-        return
-    await update.message.reply_text(
-        "✏️ <b>Rename Karo</b>\nKaun sa group?",
-        reply_markup=_group_select_kb("ren_group"), parse_mode="HTML"
-    )
-
-
-async def cmd_setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    config  = load_config()
-    buttons = config.get("buttons", {})
-    await update.message.reply_text(
-        "🎛️ <b>Button Settings</b>\n\n"
-        + _setbutton_status_text(buttons)
-        + "\n\n<i>Kaun sa configure karna hai?</i>",
-        parse_mode="HTML",
-        reply_markup=_setbutton_main_kb(buttons)
-    )
-
-
-async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    context.user_data.clear()
-    context.user_data["action"] = "wait_group_name"
-    await update.message.reply_text(
-        "➕ <b>Naya Group Banao</b>\n\nGroup ka naam type karo:",
-        parse_mode="HTML"
-    )
-
-
-async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not load_config().get("groups"):
-        await update.message.reply_text("⚠️ Pehle /addgroup se ek group banao.")
-        return
-    await update.message.reply_text(
-        "➕ <b>Channel Add Karo</b>\nKaun se group mein?",
-        reply_markup=_group_select_kb("ac_group"), parse_mode="HTML"
-    )
-
-
-async def cmd_deletegroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not load_config().get("groups"):
-        await update.message.reply_text("⚠️ Koi group nahi.")
-        return
-    await update.message.reply_text(
-        "🗑️ <b>Group Delete Karo</b>\nKaun sa group?",
-        reply_markup=_group_select_kb("del_group"), parse_mode="HTML"
-    )
-
-
-async def cmd_deletechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not load_config().get("groups"):
-        await update.message.reply_text("⚠️ Koi group nahi.")
-        return
-    await update.message.reply_text(
-        "🗑️ <b>Channel Delete Karo</b>\nKaun se group se?",
-        reply_markup=_group_select_kb("dc_group"), parse_mode="HTML"
-    )
-
-
 async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -580,35 +346,6 @@ async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<pre>{html_lib.escape(config_json)}</pre>",
         parse_mode="HTML"
     )
-
-
-# =============================================================================
-# CHANNEL POSTER
-# =============================================================================
-async def _post_to_channels(context, config, category, send_fn, base_markup=None) -> tuple:
-    """
-    Post to all matching channels. send_fn receives (channel, markup).
-    Per-group: if group has show_buttons=False, markup is None for that group.
-    """
-    sent_channels = []
-    errors        = []
-    for group in config.get("groups", []):
-        if not group.get("enabled", True):
-            continue
-        show_buttons = group.get("show_buttons", True)
-        group_markup = base_markup if show_buttons else None
-        for ch_obj in group.get("channels", []):
-            if category not in ch_obj.get("categories", []):
-                continue
-            channel = ch_obj.get("channel", "").strip()
-            if not channel:
-                continue
-            try:
-                await send_fn(channel, group_markup)
-                sent_channels.append(channel)
-            except Exception as e:
-                errors.append(f"{channel}: {e}")
-    return sent_channels, errors
 
 
 # =============================================================================
@@ -648,13 +385,19 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not raw_plain.strip() and not all_urls and has_photo:
-        await msg.reply_text(
-            "⚠️ Photo ke saath product ka naam ya link bhi bhejo."
-        )
+        await msg.reply_text("⚠️ Photo ke saath product ka naam ya link bhi bhejo.")
         return
 
     config       = load_config()
+    channel      = config.get("channel", "").strip()
     final_markup = build_final_markup(config)
+
+    if not channel:
+        await msg.reply_text(
+            "⚠️ <b>Channel set nahi hua!</b>\n/setchannel se channel set karo.",
+            parse_mode="HTML"
+        )
+        return
 
     try:
         cleanup_old_entries()
@@ -664,7 +407,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ==========================================================================
     # CASE 1: Single Amazon product link — full enrichment
     # ==========================================================================
-    if single_amazon and has_amazon:
+    if single_amazon:
         amazon_url = amazon_urls[0]
 
         resolved_url = amazon_url
@@ -696,7 +439,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            caption_html = await build_amazon_caption(product, short_link, raw_plain)
+            caption_html = build_amazon_caption(product, short_link)
             image_url    = product.get("image_url", "")
             api_note     = ""
         else:
@@ -712,32 +455,8 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await wait_msg.delete()
 
-        url_slug_words = ""
-        if not product:
-            try:
-                parsed_path = urllib.parse.urlparse(amazon_url).path
-                slug_parts  = [p for p in parsed_path.split("/")
-                               if p and p.lower() != "dp"
-                               and not re.fullmatch(r"[A-Za-z0-9]{10}", p)]
-                url_slug_words = " ".join(slug_parts).replace("-", " ") + " "
-            except Exception:
-                pass
-        detect_text = ((product.get("title", "") + " ") if product else url_slug_words) + raw_plain
+        # Post to channel
         try:
-            result   = await detect_category(detect_text)
-            category, method, ai_error, matched_kws = (list(result) + [None, None, None, None])[:4]
-        except Exception as e:
-            await msg.reply_text(
-                f"❌ Category detection mein error:\n<code>{html_lib.escape(str(e))}</code>",
-                parse_mode="HTML"
-            )
-            return
-
-        if not category:
-            await msg.reply_text("⚠️ Category detect nahi ho saki! Product naam hona chahiye message mein.")
-            return
-
-        async def send_amazon(channel, markup):
             if has_photo:
                 await context.bot.copy_message(
                     chat_id=channel,
@@ -745,7 +464,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=msg.message_id,
                     caption=caption_html,
                     parse_mode="HTML",
-                    reply_markup=markup,
+                    reply_markup=final_markup,
                 )
             elif image_url:
                 await context.bot.send_photo(
@@ -753,7 +472,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     photo=image_url,
                     caption=caption_html,
                     parse_mode="HTML",
-                    reply_markup=markup,
+                    reply_markup=final_markup,
                 )
             else:
                 await context.bot.send_message(
@@ -761,35 +480,28 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=caption_html,
                     parse_mode="HTML",
                     disable_web_page_preview=True,
-                    reply_markup=markup,
+                    reply_markup=final_markup,
                 )
 
-        sent_channels, errors = await _post_to_channels(
-            context, config, category, send_amazon, base_markup=final_markup
-        )
+            if title:
+                mark_posted(title)
 
-        if sent_channels and title:
-            mark_posted(title)
+            reply_lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
+            if api_note:
+                reply_lines.append(api_note)
+            reply_lines.append(f"\n📢 Posted to: <code>{html_lib.escape(channel)}</code>")
+            await msg.reply_text("\n".join(reply_lines), parse_mode="HTML", disable_web_page_preview=True)
 
-        await _send_admin_reply(
-            msg,
-            headline      = "✅ <b>Amazon Deal Post Ho Gaya!</b>" if sent_channels else "⚠️ <b>Koi channel nahi mila!</b>",
-            category      = category,
-            method        = method,
-            matched_kws   = matched_kws or [],
-            ai_error      = ai_error,
-            sent_channels = sent_channels,
-            errors        = errors,
-            extra_line    = api_note,
-        )
+        except Exception as e:
+            await msg.reply_text(
+                f"❌ <b>Post nahi ho saka!</b>\n<code>{html_lib.escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
         return
 
     # ==========================================================================
     # CASE 2: Multiple links or non-Amazon — normal post with affiliate links
     # ==========================================================================
-
-    # FIX: Remove footer FIRST (on original text with correct entity offsets),
-    # THEN replace amazon links in the cleaned text
     cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
 
     if has_amazon:
@@ -797,7 +509,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         updated_plain = cleaned_plain
 
-    # Duplicate check for non-Amazon messages — based on caption text
+    # Duplicate check
     dup_key = raw_plain.strip()[:300]
     if dup_key:
         dup, dup_time = is_duplicate(dup_key)
@@ -812,26 +524,8 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     body_html  = entities_to_html(updated_plain, cleaned_entities)
     final_html = GREETING + body_html
 
+    # Post to channel
     try:
-        result   = await detect_category(raw_plain)
-        category, method, ai_error, matched_kws = (list(result) + [None, None, None, None])[:4]
-    except Exception as e:
-        await msg.reply_text(
-            f"❌ Category detection mein error:\n<code>{html_lib.escape(str(e))}</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    if not category:
-        err_detail = f"\n\n⚠️ AI Error: <code>{html_lib.escape(str(ai_error))}</code>" if ai_error else ""
-        await msg.reply_text(
-            f"⚠️ Category detect nahi ho saki!\n"
-            f"Message mein product naam/brand hona chahiye.{err_detail}",
-            parse_mode="HTML"
-        )
-        return
-
-    async def send_normal(channel, markup):
         if msg.caption is not None:
             await context.bot.copy_message(
                 chat_id=channel,
@@ -839,7 +533,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=msg.message_id,
                 caption=final_html,
                 parse_mode="HTML",
-                reply_markup=markup,
+                reply_markup=final_markup,
             )
         elif msg.text:
             await context.bot.send_message(
@@ -847,33 +541,30 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=final_html,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=markup,
+                reply_markup=final_markup,
             )
         else:
             await context.bot.copy_message(
                 chat_id=channel,
                 from_chat_id=msg.chat_id,
                 message_id=msg.message_id,
-                reply_markup=markup,
+                reply_markup=final_markup,
             )
 
-    sent_channels, errors = await _post_to_channels(
-        context, config, category, send_normal, base_markup=final_markup
-    )
+        if dup_key:
+            mark_posted(dup_key)
 
-    if sent_channels and dup_key:
-        mark_posted(dup_key)
+        await msg.reply_text(
+            f"✅ <b>Post Ho Gaya!</b>\n📢 <code>{html_lib.escape(channel)}</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
 
-    await _send_admin_reply(
-        msg,
-        headline      = "✅ <b>Post Ho Gaya!</b>" if sent_channels else "⚠️ <b>Koi channel nahi mila!</b>",
-        category      = category,
-        method        = method,
-        matched_kws   = matched_kws or [],
-        ai_error      = ai_error,
-        sent_channels = sent_channels,
-        errors        = errors,
-    )
+    except Exception as e:
+        await msg.reply_text(
+            f"❌ <b>Post nahi ho saka!</b>\n<code>{html_lib.escape(str(e))}</code>",
+            parse_mode="HTML"
+        )
 
 
 # =============================================================================
@@ -885,9 +576,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Unauthorized.")
         return
     await query.answer()
-    data   = query.data
-    config = load_config()
-    groups = config.get("groups", [])
+    data = query.data
 
     if data == "cancel":
         context.user_data.clear()
@@ -897,249 +586,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if data.startswith("toggle_") and data != "toggle_done":
-        try:
-            idx = int(data.split("_")[1])
-            if idx < len(groups):
-                groups[idx]["enabled"] = not groups[idx].get("enabled", True)
-                config["groups"] = groups
-                save_config(config)
-            await query.edit_message_reply_markup(reply_markup=_toggle_keyboard(groups))
-        except Exception as e:
-            logger.error(f"Toggle error: {e}")
-        return
-
-    if data == "toggle_done":
-        lines = [("✅ ON" if g.get("enabled") else "❌ OFF") + f" — {g.get('name','')}" for g in groups]
-        try:
-            await query.edit_message_text("✅ Saved!\n\n" + "\n".join(lines))
-        except Exception:
-            pass
-        return
-
-    if data.startswith("eg_group_"):
-        try:
-            gi       = int(data.split("_")[2])
-            group    = groups[gi]
-            channels = group.get("channels", [])
-            context.user_data["edit_group_idx"] = gi
-            show_buttons = group.get("show_buttons", True)
-            btn_status   = "✅ ON" if show_buttons else "❌ OFF"
-            buttons = []
-            for j, ch_obj in enumerate(channels):
-                cats = ", ".join(ch_obj.get("categories", []))
-                buttons.append([InlineKeyboardButton(
-                    f"{ch_obj.get('channel','')} [{cats}]", callback_data=f"eg_ch_{gi}_{j}"
-                )])
-            buttons.append([InlineKeyboardButton(
-                f"🎛️ Inline Buttons: {btn_status}", callback_data=f"gb_toggle_{gi}"
-            )])
-            buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-            ch_hint = "" if channels else "\n⚠️ Koi channel nahi — /addchannel se add karo"
-            await query.edit_message_text(
-                f"✏️ <b>{html_lib.escape(group.get('name',''))}</b>{ch_hint}\n\n"
-                f"🎛️ Inline Buttons is group ke liye: <b>{btn_status}</b>",
-                reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("gb_toggle_"):
-        try:
-            gi           = int(data.split("_")[2])
-            current      = config["groups"][gi].get("show_buttons", True)
-            config["groups"][gi]["show_buttons"] = not current
-            save_config(config)
-            show_buttons = not current
-            btn_status   = "✅ ON" if show_buttons else "❌ OFF"
-            group    = config["groups"][gi]
-            channels = group.get("channels", [])
-            buttons  = []
-            for j, ch_obj in enumerate(channels):
-                cats = ", ".join(ch_obj.get("categories", []))
-                buttons.append([InlineKeyboardButton(
-                    f"{ch_obj.get('channel','')} [{cats}]", callback_data=f"eg_ch_{gi}_{j}"
-                )])
-            buttons.append([InlineKeyboardButton(
-                f"🎛️ Inline Buttons: {btn_status}", callback_data=f"gb_toggle_{gi}"
-            )])
-            buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-            await query.edit_message_text(
-                f"✅ <b>Saved!</b>\n\n"
-                f"✏️ <b>{html_lib.escape(group.get('name',''))}</b>\n"
-                f"🎛️ Inline Buttons: <b>{btn_status}</b>",
-                reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("eg_ch_"):
-        try:
-            parts  = data.split("_")
-            gi, ci = int(parts[2]), int(parts[3])
-            ch_obj = groups[gi]["channels"][ci]
-            context.user_data["edit_group_idx"]   = gi
-            context.user_data["edit_channel_idx"] = ci
-            selected = ch_obj.get("categories", [])
-            context.user_data["selected_cats"] = list(selected)
-            context.user_data["action"] = "editing_cats"
-            await query.edit_message_text(
-                f"✏️ <b>{html_lib.escape(ch_obj.get('channel',''))}</b> — Categories select karo:",
-                reply_markup=_cat_toggle_kb(selected, "eg_cat_done"),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("cat_") and context.user_data.get("action") in (
-        "editing_cats", "adding_channel_cats", "adding_group_cats"
-    ):
-        cat      = data[4:]
-        selected = context.user_data.get("selected_cats", [])
-        if cat in selected:
-            selected.remove(cat)
-        else:
-            selected.append(cat)
-        context.user_data["selected_cats"] = selected
-        action  = context.user_data.get("action")
-        done_cb = {
-            "editing_cats":        "eg_cat_done",
-            "adding_channel_cats": "ac_cat_done",
-            "adding_group_cats":   "ag_cat_done",
-        }.get(action, "eg_cat_done")
-        try:
-            await query.edit_message_reply_markup(reply_markup=_cat_toggle_kb(selected, done_cb))
-        except Exception:
-            pass
-        return
-
-    if data == "eg_cat_done":
-        try:
-            gi       = context.user_data.get("edit_group_idx", 0)
-            ci       = context.user_data.get("edit_channel_idx", 0)
-            selected = context.user_data.get("selected_cats", [])
-            config["groups"][gi]["channels"][ci]["categories"] = selected
-            save_config(config)
-            cats_str = ", ".join(c.capitalize() for c in selected) or "None"
-            context.user_data.clear()
-            await query.edit_message_text(f"✅ Categories updated!\n\nCategories: {cats_str}")
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("ren_group_"):
-        try:
-            gi       = int(data.split("_")[2])
-            context.user_data["rename_group_idx"] = gi
-            context.user_data["action"] = "wait_rename"
-            old_name = groups[gi].get("name", "")
-            await query.edit_message_text(
-                f"✏️ Group <b>'{html_lib.escape(old_name)}'</b> ka naya naam type karo:",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("ac_group_"):
-        try:
-            gi = int(data.split("_")[2])
-            context.user_data["add_channel_group_idx"] = gi
-            context.user_data["action"] = "wait_channel_name"
-            await query.edit_message_text(
-                f"➕ <b>{html_lib.escape(groups[gi].get('name',''))}</b> mein channel add karo\n\n"
-                f"Channel ID type karo (jaise @mychannel ya -100123456):",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data == "ac_cat_done":
-        try:
-            gi       = context.user_data.get("add_channel_group_idx", 0)
-            ch_name  = context.user_data.get("new_channel_name", "")
-            selected = context.user_data.get("selected_cats", [])
-            config["groups"][gi]["channels"].append({"channel": ch_name, "categories": selected})
-            save_config(config)
-            cats_str = ", ".join(c.capitalize() for c in selected) or "None"
-            context.user_data.clear()
-            await query.edit_message_text(
-                f"✅ Channel <b>{html_lib.escape(ch_name)}</b> add ho gaya!\nCategories: {cats_str}",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data == "ag_cat_done":
-        try:
-            group_name = context.user_data.get("new_group_name", "New Group")
-            ch_name    = context.user_data.get("new_channel_name", "")
-            selected   = context.user_data.get("selected_cats", [])
-            new_group  = {
-                "name": group_name, "enabled": True,
-                "channels": [{"channel": ch_name, "categories": selected}],
-            }
-            config["groups"].append(new_group)
-            save_config(config)
-            cats_str = ", ".join(c.capitalize() for c in selected) or "None"
-            context.user_data.clear()
-            await query.edit_message_text(
-                f"✅ Group <b>{html_lib.escape(group_name)}</b> ban gaya!\n"
-                f"📢 Channel: {html_lib.escape(ch_name)}\nCategories: {cats_str}",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("del_group_"):
-        try:
-            gi      = int(data.split("_")[2])
-            removed = config["groups"].pop(gi)
-            save_config(config)
-            await query.edit_message_text(
-                f"🗑️ Group <b>'{html_lib.escape(removed.get('name',''))}'</b> delete ho gaya.",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("dc_group_"):
-        try:
-            gi = int(data.split("_")[2])
-            context.user_data["dc_group_idx"] = gi
-            await query.edit_message_text(
-                f"🗑️ <b>{html_lib.escape(groups[gi].get('name',''))}</b> — Kaun sa channel delete karo?",
-                reply_markup=_channel_select_kb(gi, "dc_ch"),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    if data.startswith("dc_ch_"):
-        try:
-            parts   = data.split("_")
-            gi, ci  = int(parts[2]), int(parts[3])
-            removed = config["groups"][gi]["channels"].pop(ci)
-            save_config(config)
-            await query.edit_message_text(
-                f"🗑️ Channel <b>{html_lib.escape(removed.get('channel',''))}</b> delete ho gaya.",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        return
-
-    # ==========================================================================
-    # /setbutton callbacks — btn_key is always "btn1" or "btn2"
-    # ==========================================================================
+    # /setbutton callbacks
     if data == "sb_main":
         cfg     = load_config()
         buttons = cfg.get("buttons", {})
@@ -1156,7 +603,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ("sb_btn1", "sb_btn2"):
-        btn_key = data.split("_")[1]   # "btn1" or "btn2"
+        btn_key = data.split("_")[1]
         cfg     = load_config()
         btn     = cfg.get("buttons", {}).get(btn_key, {})
         try:
@@ -1170,7 +617,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ("sb_btn1_toggle", "sb_btn2_toggle"):
-        btn_key = data.split("_")[1]   # "btn1" or "btn2"
+        btn_key = data.split("_")[1]
         cfg     = load_config()
         buttons = cfg.setdefault("buttons", {})
         btn     = buttons.setdefault(btn_key, {})
@@ -1268,6 +715,22 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not action:
         return
 
+    # /setchannel flow
+    if action == "wait_channel_id":
+        if not text:
+            await update.message.reply_text("⚠️ Channel ID khali nahi ho sakta.")
+            return
+        cfg = load_config()
+        cfg["channel"] = text
+        save_config(cfg)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Channel set ho gaya!\n📢 <code>{html_lib.escape(text)}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # /setbutton label flow
     if action.endswith("_wait_label"):
         btn_key = context.user_data.get("sb_btn_key", "btn1")
         if len(text) > 20:
@@ -1286,6 +749,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # /setbutton link flow
     if action.endswith("_wait_link"):
         btn_key = context.user_data.get("sb_btn_key", "btn1")
         if text.startswith("t.me/"):
@@ -1308,50 +772,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if action == "wait_group_name":
-        context.user_data["new_group_name"] = text
-        context.user_data["action"] = "wait_group_channel"
-        await update.message.reply_text(
-            f"➕ Group <b>'{html_lib.escape(text)}'</b> — Pehla channel ID type karo:\n(jaise @mychannel ya -100123456789)",
-            parse_mode="HTML"
-        )
-        return
-
-    if action == "wait_group_channel":
-        context.user_data["new_channel_name"] = text
-        context.user_data["action"] = "adding_group_cats"
-        context.user_data["selected_cats"] = []
-        await update.message.reply_text(
-            f"➕ <b>{html_lib.escape(text)}</b> — Is channel ke liye categories select karo:",
-            reply_markup=_cat_toggle_kb([], "ag_cat_done"),
-            parse_mode="HTML"
-        )
-        return
-
-    if action == "wait_channel_name":
-        context.user_data["new_channel_name"] = text
-        context.user_data["action"] = "adding_channel_cats"
-        context.user_data["selected_cats"] = []
-        await update.message.reply_text(
-            f"➕ <b>{html_lib.escape(text)}</b> — Categories select karo:",
-            reply_markup=_cat_toggle_kb([], "ac_cat_done"),
-            parse_mode="HTML"
-        )
-        return
-
-    if action == "wait_rename":
-        gi = context.user_data.get("rename_group_idx", 0)
-        cfg = load_config()
-        old_name = cfg["groups"][gi].get("name", "")
-        cfg["groups"][gi]["name"] = text
-        save_config(cfg)
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Group rename ho gaya!\n<b>{html_lib.escape(old_name)}</b> → <b>{html_lib.escape(text)}</b>",
-            parse_mode="HTML"
-        )
-        return
-
 
 # =============================================================================
 # MAIN
@@ -1370,20 +790,13 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("testai",        cmd_testai))
-    app.add_handler(CommandHandler("testamz",       cmd_testamz))
-    app.add_handler(CommandHandler("help",          cmd_help))
-    app.add_handler(CommandHandler("status",        cmd_status))
-    app.add_handler(CommandHandler("manage",        cmd_manage))
-    app.add_handler(CommandHandler("editgroup",     cmd_editgroup))
-    app.add_handler(CommandHandler("rename",        cmd_rename))
-    app.add_handler(CommandHandler("setbutton",     cmd_setbutton))
-    app.add_handler(CommandHandler("addgroup",      cmd_addgroup))
-    app.add_handler(CommandHandler("addchannel",    cmd_addchannel))
-    app.add_handler(CommandHandler("deletegroup",   cmd_deletegroup))
-    app.add_handler(CommandHandler("deletechannel", cmd_deletechannel))
-    app.add_handler(CommandHandler("exportconfig",  cmd_exportconfig))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("setchannel",  cmd_setchannel))
+    app.add_handler(CommandHandler("setbutton",   cmd_setbutton))
+    app.add_handler(CommandHandler("testamz",     cmd_testamz))
+    app.add_handler(CommandHandler("exportconfig", cmd_exportconfig))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
 
