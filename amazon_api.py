@@ -12,7 +12,6 @@ CREDENTIAL_SECRET  = os.getenv("CREDENTIAL_SECRET", "")
 CREDENTIAL_VERSION = os.getenv("CREDENTIAL_VERSION", "3.2")
 MARKETPLACE        = os.getenv("MARKETPLACE", "www.amazon.in")
 
-# PARTNER_TAG: Railway variable se aata hai — koi hardcoded default nahi
 PARTNER_TAG = os.getenv("PARTNER_TAG", "")
 if not PARTNER_TAG:
     logger.warning("PARTNER_TAG env var set nahi hai! Affiliate links mein tag nahi hoga.")
@@ -31,6 +30,13 @@ API_BASE = "https://creatorsapi.amazon"
 ITEMS_EP = f"{API_BASE}/catalog/v1/getItems"
 
 ASIN_PAT = re.compile(r"/(?:dp|gp/product|exec/obidos/ASIN|o/ASIN)/([A-Za-z0-9]{10})")
+
+# Short / modern Amazon URL types that need redirect resolution
+NEEDS_REDIRECT = (
+    "amzn.to", "amzn.in", "amzn.eu", "amzn.asia",
+    "a.co",
+    "link.amazon",
+)
 
 _token_cache: dict = {"token": None, "expires_at": None}
 
@@ -60,8 +66,6 @@ async def _get_token() -> str | None:
         logger.error(f"Unsupported CREDENTIAL_VERSION: {CREDENTIAL_VERSION}")
         return None
 
-    # v3.x (LWA) → JSON body  |  v2.x (Cognito) → form-encoded
-    # Source: Amazon Creators API SDK oauth2_token_manager.py
     is_lwa = CREDENTIAL_VERSION.startswith("3.")
     token_payload = {
         "grant_type":    "client_credentials",
@@ -75,14 +79,14 @@ async def _get_token() -> str | None:
             if is_lwa:
                 req = session.post(
                     token_url,
-                    json=token_payload,                          # LWA needs JSON
+                    json=token_payload,
                     headers={"Content-Type": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=15),
                 )
             else:
                 req = session.post(
                     token_url,
-                    data=token_payload,                          # Cognito needs form-encoded
+                    data=token_payload,
                     timeout=aiohttp.ClientTimeout(total=15),
                 )
             async with req as resp:
@@ -112,12 +116,25 @@ def extract_asin(url: str) -> str | None:
     q = re.search(r"[?&]ASIN=([A-Za-z0-9]{10})", url)
     if q:
         return q.group(1).upper()
+    # link.amazon/ASIN style: path segment that looks like ASIN
+    path = urllib.parse.urlparse(url).path.strip("/")
+    if re.fullmatch(r"[A-Za-z0-9]{10}", path):
+        return path.upper()
     return None
 
 
 def is_amazon_url(url: str) -> bool:
-    host = urllib.parse.urlparse(url).netloc.lower()
-    return "amazon" in host or "amzn" in host
+    """Detect any Amazon-related URL including short links."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+        # Standard amazon domains + short link domains
+        return (
+            "amazon" in host or
+            "amzn" in host or
+            host in ("a.co", "www.a.co")
+        )
+    except Exception:
+        return False
 
 
 def is_amazon_search_url(url: str) -> bool:
@@ -125,11 +142,12 @@ def is_amazon_search_url(url: str) -> bool:
     return any(m in url for m in markers)
 
 
+def needs_redirect(url: str) -> bool:
+    """Returns True if URL is a short link that needs redirect resolution."""
+    return any(d in url for d in NEEDS_REDIRECT)
+
+
 def _strip_tag_param(url: str) -> str:
-    """
-    Kisi bhi existing affiliate tag= parameter ko URL se remove karo.
-    Ensures sirf ek hi clean tag lagta hai — purana kisi aur ka tag nahi rahega.
-    """
     try:
         parsed = urllib.parse.urlparse(url)
         params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -141,10 +159,6 @@ def _strip_tag_param(url: str) -> str:
 
 
 def make_affiliate_url(asin: str) -> str:
-    """
-    Clean affiliate URL — sirf ASIN aur PARTNER_TAG, kuch aur nahi.
-    MARKETPLACE env var se domain aata hai.
-    """
     base = f"https://{MARKETPLACE}/dp/{asin}"
     if PARTNER_TAG:
         return f"{base}?tag={PARTNER_TAG}"
@@ -166,21 +180,14 @@ async def _resolve_redirect(url: str) -> str:
 
 
 async def get_short_affiliate_link(url: str) -> str:
-    """
-    Amazon URL ko clean affiliate link mein convert karo.
-    - ASIN milne pe: ekdum clean URL (https://domain/dp/ASIN?tag=TAG)
-    - ASIN nahi milne pe: existing tag strip karke sirf apna tag add karo
-    """
     asin = extract_asin(url)
     if not asin:
         resolved = await _resolve_redirect(url)
         asin = extract_asin(resolved)
 
     if asin:
-        # Best case: clean ASIN-based URL
         return make_affiliate_url(asin)
 
-    # Fallback: strip any old tag, add ours
     cleaned = _strip_tag_param(url)
     if PARTNER_TAG:
         sep = "&" if "?" in cleaned else "?"
@@ -294,7 +301,7 @@ async def get_product_by_asin(asin: str) -> dict | None:
 
 async def enrich_amazon_url(url: str) -> dict | None:
     resolved = url
-    if "amzn.to" in url or "amzn.in" in url:
+    if needs_redirect(url):
         resolved = await _resolve_redirect(url)
 
     asin = extract_asin(resolved)
