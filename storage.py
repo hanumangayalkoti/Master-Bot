@@ -14,6 +14,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 DEFAULT_CONFIG = {
     "channel": "",
+    "watermark": {
+        "enabled": True,
+        "text": "@DealKoti",
+    },
     "buttons": {
         "btn1": {"label": "Join Channel", "url": "", "enabled": False},
         "btn2": {"label": "More Deals",   "url": "", "enabled": False},
@@ -70,17 +74,13 @@ def load_config() -> dict:
         if row:
             cfg = json.loads(row[0])
             cfg.setdefault("channel", "")
-            cfg.setdefault("buttons", DEFAULT_CONFIG["buttons"].copy())
+            cfg.setdefault("watermark", DEFAULT_CONFIG["watermark"].copy())
+            cfg.setdefault("buttons",   DEFAULT_CONFIG["buttons"].copy())
             return cfg
     except Exception as e:
         logger.error(f"Config load error: {e}")
-    return {
-        "channel": "",
-        "buttons": {
-            "btn1": {"label": "Join Channel", "url": "", "enabled": False},
-            "btn2": {"label": "More Deals",   "url": "", "enabled": False},
-        },
-    }
+    import copy
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(config: dict):
