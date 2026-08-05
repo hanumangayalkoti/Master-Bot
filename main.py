@@ -1021,7 +1021,21 @@ def main():
         logger.error(f"DB init failed: {e}")
         raise
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Register command list so they appear in Telegram's "/" menu
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("start",         "Bot shuru karo"),
+            ("help",          "Saari commands dekho"),
+            ("status",        "Channel aur watermark status"),
+            ("setchannel",    "Deal channel set karo"),
+            ("watermark",     "Watermark ON/OFF aur text change karo"),
+            ("setbutton",     "Deal buttons configure karo"),
+            ("testamz",       "Amazon API test karo"),
+            ("exportconfig",  "Config ka backup lo"),
+        ])
+        logger.info("Bot commands Telegram pe register ho gayi.")
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("help",         cmd_help))
