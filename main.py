@@ -1,10 +1,11 @@
 import os
+import io
 import re
 import html as html_lib
 import logging
-import urllib.parse
+import aiohttp
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
@@ -12,11 +13,12 @@ from telegram.ext import (
 )
 from amazon_api import (
     is_amazon_url, is_amazon_search_url, enrich_amazon_url,
-    get_short_affiliate_link, _resolve_redirect,
+    get_short_affiliate_link, _resolve_redirect, needs_redirect,
 )
 from caption import build_amazon_caption, _safe_truncate, _TAG_RE
 from database import is_duplicate, mark_posted, cleanup_old_entries
 from storage import load_config, save_config, init_db
+from watermark import apply_watermark
 
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
@@ -64,6 +66,34 @@ async def replace_amazon_links(text: str, urls: list) -> str:
             short = await get_short_affiliate_link(url)
             result = result.replace(url, short)
     return result
+
+
+async def _download_image(url: str) -> bytes | None:
+    """Download image from URL, return bytes or None."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception as e:
+        logger.error(f"Image download fail: {e}")
+    return None
+
+
+async def _get_photo_bytes(bot, msg) -> bytes | None:
+    """Download photo from a Telegram message, return bytes or None."""
+    if not msg.photo:
+        return None
+    try:
+        file = await bot.get_file(msg.photo[-1].file_id)
+        return bytes(await file.download_as_bytearray())
+    except Exception as e:
+        logger.error(f"Photo download fail: {e}")
+    return None
 
 
 # =============================================================================
@@ -167,24 +197,41 @@ def entities_to_html(text: str, entities: list) -> str:
 
 
 # =============================================================================
+# WATERMARK UI HELPERS
+# =============================================================================
+def _watermark_status_text(wm: dict) -> str:
+    status   = "✅ ON" if wm.get("enabled", True) else "❌ OFF"
+    wm_text  = wm.get("text", "@DealKoti")
+    return (
+        f"🖼️ <b>Watermark Settings</b>\n\n"
+        f"Status : <b>{status}</b>\n"
+        f"Text   : <code>{html_lib.escape(wm_text)}</code>\n\n"
+        f"<i>Watermark har image ke bottom-right corner pe lagta hai.</i>"
+    )
+
+
+def _watermark_kb(wm: dict) -> InlineKeyboardMarkup:
+    toggle_label = "🔴 Turn OFF" if wm.get("enabled", True) else "🟢 Turn ON"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Text Badlo",  callback_data="wm_set_text")],
+        [InlineKeyboardButton(toggle_label,     callback_data="wm_toggle")],
+        [InlineKeyboardButton("❌ Cancel",       callback_data="cancel")],
+    ])
+
+
+# =============================================================================
 # SETBUTTON UI HELPERS
 # =============================================================================
 def _setbutton_status_text(buttons: dict) -> str:
     b1 = buttons.get("btn1", {})
     b2 = buttons.get("btn2", {})
-    b1_status = "✅ ON" if b1.get("enabled") else "❌ OFF"
-    b2_status = "✅ ON" if b2.get("enabled") else "❌ OFF"
-    b1_label  = b1.get("label", "Button 1")
-    b2_label  = b2.get("label", "Button 2")
-    b1_url    = b1.get("url") or "—"
-    b2_url    = b2.get("url") or "—"
     return (
-        f"📌 <b>Button 1</b> — {b1_status}\n"
-        f"   Naam: {html_lib.escape(b1_label)}\n"
-        f"   Link: <code>{html_lib.escape(b1_url)}</code>\n\n"
-        f"📌 <b>Button 2</b> — {b2_status}\n"
-        f"   Naam: {html_lib.escape(b2_label)}\n"
-        f"   Link: <code>{html_lib.escape(b2_url)}</code>"
+        f"📌 <b>Button 1</b> — {'✅ ON' if b1.get('enabled') else '❌ OFF'}\n"
+        f"   Naam: {html_lib.escape(b1.get('label', '-'))}\n"
+        f"   Link: <code>{html_lib.escape(b1.get('url') or '—')}</code>\n\n"
+        f"📌 <b>Button 2</b> — {'✅ ON' if b2.get('enabled') else '❌ OFF'}\n"
+        f"   Naam: {html_lib.escape(b2.get('label', '-'))}\n"
+        f"   Link: <code>{html_lib.escape(b2.get('url') or '—')}</code>"
     )
 
 
@@ -215,9 +262,9 @@ def _btn_detail_text(btn_key: str, btn: dict) -> str:
     status = "✅ ON" if btn.get("enabled") else "❌ OFF"
     return (
         f"🎛️ <b>Button {num} Settings</b>\n\n"
-        f"📝 Naam: <b>{html_lib.escape(label)}</b>\n"
-        f"🔗 Link: <code>{html_lib.escape(url)}</code>\n"
-        f"Status: {status}"
+        f"📝 Naam  : <b>{html_lib.escape(label)}</b>\n"
+        f"🔗 Link  : <code>{html_lib.escape(url)}</code>\n"
+        f"Status : {status}"
     )
 
 
@@ -240,12 +287,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📖 <b>DealsKoti Bot — Sare Commands</b>\n\n"
-        "📊 /status — Channel aur buttons ka status dekho\n"
+        "📊 /status — Channel, watermark aur buttons ka status\n"
         "📢 /setchannel — Post karne wala channel set karo\n"
+        "🖼️ /watermark — Watermark settings (on/off + text)\n"
         "🎛️ /setbutton — Post ke neeche buttons set karo\n"
         "🧪 /testamz — Amazon API test karo\n"
         "💾 /exportconfig — Config backup karo\n"
-        "ℹ️ /start — Bot ki info",
+        "ℹ️ /start — Bot ki info\n\n"
+        "<b>Watermark shortcuts:</b>\n"
+        "/watermark on — ON karo\n"
+        "/watermark off — OFF karo",
         parse_mode="HTML"
     )
 
@@ -254,20 +305,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     config  = load_config()
-    channel = config.get("channel", "") or "Set nahi hua (/setchannel se set karo)"
+    channel = config.get("channel", "") or "❌ Set nahi hua (/setchannel)"
+    wm      = config.get("watermark", {"enabled": True, "text": "@DealKoti"})
     buttons = config.get("buttons", {})
-
-    b1 = buttons.get("btn1", {})
-    b2 = buttons.get("btn2", {})
+    b1      = buttons.get("btn1", {})
+    b2      = buttons.get("btn2", {})
 
     lines = [
         "⚙️ <b>Bot Status</b>\n",
-        f"📢 <b>Channel:</b> <code>{html_lib.escape(channel)}</code>\n",
+        f"📢 <b>Channel :</b> <code>{html_lib.escape(channel)}</code>\n",
+        f"🖼️ <b>Watermark:</b> {'✅ ON' if wm.get('enabled') else '❌ OFF'} — "
+        f"<code>{html_lib.escape(wm.get('text', '@DealKoti'))}</code>\n",
         "🎛️ <b>Buttons:</b>",
         f"  Button 1: {'✅ ON' if b1.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b1.get('label', '-'))}</b>",
         f"  Button 2: {'✅ ON' if b2.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b2.get('label', '-'))}</b>",
     ]
-
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -276,13 +328,49 @@ async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.clear()
     context.user_data["action"] = "wait_channel_id"
-    config = load_config()
+    config  = load_config()
     current = config.get("channel", "") or "Set nahi hua"
     await update.message.reply_text(
         f"📢 <b>Channel Set Karo</b>\n\n"
         f"Current: <code>{html_lib.escape(current)}</code>\n\n"
         f"Naya channel ID type karo (jaise @mychannel ya -100123456789):",
         parse_mode="HTML"
+    )
+
+
+async def cmd_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args   = context.args or []
+    config = load_config()
+    wm     = config.setdefault("watermark", {"enabled": True, "text": "@DealKoti"})
+
+    if args:
+        arg = args[0].lower()
+        if arg == "on":
+            wm["enabled"] = True
+            config["watermark"] = wm
+            save_config(config)
+            await update.message.reply_text(
+                "✅ Watermark <b>ON</b> kar diya!\n"
+                "Ab har image pe watermark lagega.", parse_mode="HTML"
+            )
+            return
+        elif arg == "off":
+            wm["enabled"] = False
+            config["watermark"] = wm
+            save_config(config)
+            await update.message.reply_text(
+                "✅ Watermark <b>OFF</b> kar diya!\n"
+                "Ab images bina watermark ke jayengi.", parse_mode="HTML"
+            )
+            return
+
+    # Show settings menu
+    await update.message.reply_text(
+        _watermark_status_text(wm),
+        parse_mode="HTML",
+        reply_markup=_watermark_kb(wm)
     )
 
 
@@ -312,20 +400,19 @@ async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if product and product.get("title"):
             await update.message.reply_text(
                 f"✅ <b>Amazon Creators API kaam kar raha hai!</b>\n\n"
-                f"🏷️ Title: <code>{product['title'][:80]}</code>\n"
-                f"💰 Deal Price: <b>{product.get('deal_price', 'N/A')}</b>\n"
+                f"🏷️ Title   : <code>{product['title'][:80]}</code>\n"
+                f"💰 Price   : <b>{product.get('deal_price', 'N/A')}</b>\n"
                 f"📉 Discount: <b>{product.get('discount_pct', 0)}%</b>\n"
-                f"⭐ Rating: <b>{product.get('rating', 'N/A')}</b>\n"
-                f"👥 Reviews: <b>{product.get('review_count', 'N/A')}</b>\n"
-                f"🖼️ Image: <b>{'Mili ✅' if product.get('image_url') else 'Nahi mili ❌'}</b>\n"
-                f"🔗 Affiliate link: <code>{short}</code>",
+                f"⭐ Rating  : <b>{product.get('rating', 'N/A')}</b>\n"
+                f"👥 Reviews : <b>{product.get('review_count', 'N/A')}</b>\n"
+                f"🖼️ Image   : <b>{'Mili ✅' if product.get('image_url') else 'Nahi mili ❌'}</b>\n"
+                f"🔗 Link    : <code>{short}</code>",
                 parse_mode="HTML"
             )
         else:
             await update.message.reply_text(
                 "⚠️ Amazon API se product data nahi mila.\n"
-                "CREDENTIAL_ID aur CREDENTIAL_SECRET check karo.",
-                parse_mode="HTML"
+                "CREDENTIAL_ID aur CREDENTIAL_SECRET check karo."
             )
     except Exception as e:
         await update.message.reply_text(
@@ -342,7 +429,6 @@ async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config_json = json.dumps(config, indent=2, ensure_ascii=False)
     await update.message.reply_text(
         f"📦 <b>Config Export (Backup)</b>\n\n"
-        f"Is JSON ko copy karke safe jagah save karo.\n\n"
         f"<pre>{html_lib.escape(config_json)}</pre>",
         parse_mode="HTML"
     )
@@ -355,13 +441,13 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
 
-    action = context.user_data.get("action")
-    if action:
+    if context.user_data.get("action"):
         await handle_text_input(update, context)
         return
 
     msg = update.message
 
+    # ── Parse message content ──────────────────────────────────────────────
     if msg.caption is not None:
         raw_plain    = msg.caption or ""
         raw_entities = list(msg.caption_entities or [])
@@ -373,28 +459,27 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         raw_plain    = ""
         raw_entities = []
-        has_photo    = bool(msg.photo or msg.document or msg.video)
+        has_photo    = bool(msg.photo)
 
-    all_urls      = extract_urls(raw_plain)
-    amazon_urls   = get_amazon_urls(all_urls)
-    has_amazon    = len(amazon_urls) > 0
-    single_amazon = len(amazon_urls) == 1
+    all_urls    = extract_urls(raw_plain)
+    amazon_urls = get_amazon_urls(all_urls)
+    has_amazon  = len(amazon_urls) > 0
 
     if not raw_plain.strip() and not all_urls and not has_photo:
         await msg.reply_text("⚠️ Message mein koi text ya link nahi mila.")
         return
 
-    if not raw_plain.strip() and not all_urls and has_photo:
-        await msg.reply_text("⚠️ Photo ke saath product ka naam ya link bhi bhejo.")
-        return
-
+    # ── Load config ────────────────────────────────────────────────────────
     config       = load_config()
     channel      = config.get("channel", "").strip()
     final_markup = build_final_markup(config)
+    wm_cfg       = config.get("watermark", {"enabled": True, "text": "@DealKoti"})
+    wm_enabled   = wm_cfg.get("enabled", True)
+    wm_text      = wm_cfg.get("text", "@DealKoti")
 
     if not channel:
         await msg.reply_text(
-            "⚠️ <b>Channel set nahi hua!</b>\n/setchannel se channel set karo.",
+            "⚠️ <b>Channel set nahi hua!</b>\n/setchannel se pehle channel set karo.",
             parse_mode="HTML"
         )
         return
@@ -405,19 +490,49 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     # ==========================================================================
-    # CASE 1: Single Amazon product link — full enrichment
+    # CASE A: Multiple Amazon links → text only, no image
     # ==========================================================================
-    if single_amazon:
+    if has_amazon and len(amazon_urls) > 1:
+        cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
+        updated_plain = await replace_amazon_links(cleaned_plain, amazon_urls)
+        body_html  = entities_to_html(updated_plain, cleaned_entities)
+        final_html = "🙏Jai Shree Ram Dosto🙏\n\n" + body_html
+        try:
+            await context.bot.send_message(
+                chat_id=channel,
+                text=final_html,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=final_markup,
+            )
+            await msg.reply_text(
+                "✅ <b>Post ho gaya!</b>\n"
+                "⚠️ Multiple Amazon links thi — bina image ke text post kar di.",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await msg.reply_text(
+                f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
+        return
+
+    # ==========================================================================
+    # CASE B: Single Amazon link → full enrichment + image + watermark
+    # ==========================================================================
+    if has_amazon and len(amazon_urls) == 1:
         amazon_url = amazon_urls[0]
 
+        # Resolve short links to get real URL
         resolved_url = amazon_url
-        if "amzn.to" in amazon_url or "amzn.in" in amazon_url:
+        if needs_redirect(amazon_url):
             resolved_url = await _resolve_redirect(amazon_url)
 
+        # Block search pages
         if is_amazon_search_url(resolved_url):
             await msg.reply_text(
-                "❌ <b>Yeh Amazon search page ka link hai — post nahi kiya.</b>\n\n"
-                "Kisi specific product ka link bhejo 😊",
+                "🚫 <b>Skip!</b> Amazon search page tha — post nahi kiya.\n"
+                "Specific product ka link bhejo.",
                 parse_mode="HTML"
             )
             return
@@ -427,49 +542,55 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product    = await enrich_amazon_url(amazon_url)
         short_link = await get_short_affiliate_link(amazon_url)
 
+        # ── Build caption ──────────────────────────────────────────────────
         if product and product.get("title"):
             title = product["title"]
-
             dup, dup_time = is_duplicate(title)
             if dup:
                 await wait_msg.edit_text(
-                    f"⚠️ <b>Yeh deal {dup_time} already post ho chuki hai — skip kiya.</b>\n\n"
+                    f"⚠️ <b>Duplicate!</b> Yeh deal {dup_time} already post ho chuki hai — skip kiya.\n"
                     f"🏷️ {html_lib.escape(title[:80])}",
                     parse_mode="HTML"
                 )
                 return
-
             caption_html = build_amazon_caption(product, short_link)
             image_url    = product.get("image_url", "")
             api_note     = ""
         else:
             title        = None
             image_url    = ""
-            api_note     = "⚠️ Amazon API se data nahi mila — sirf affiliate link ke saath post kiya."
+            api_note     = "⚠️ Amazon API se product data nahi mila."
             cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
             body_html    = entities_to_html(cleaned_plain, cleaned_entities)
-            escaped_url  = html_lib.escape(amazon_url)
-            body_html    = body_html.replace(escaped_url, f'<a href="{short_link}">{short_link}</a>')
-            raw_caption  = "🙏Jai Shree Ram Dosto🙏\n\n" + body_html
-            caption_html = _safe_truncate(raw_caption, max_visible=1020)
+            esc_url      = html_lib.escape(amazon_url)
+            body_html    = body_html.replace(esc_url, f'<a href="{short_link}">{short_link}</a>')
+            caption_html = _safe_truncate("🙏Jai Shree Ram Dosto🙏\n\n" + body_html, 1020)
+
+        # ── Get image bytes ────────────────────────────────────────────────
+        img_bytes  = None
+        img_source = ""
+
+        # ONLY Amazon API image — NEVER use original post photo for Amazon posts
+        # (original post may have another channel's watermark already embedded)
+        if image_url:
+            img_bytes = await _download_image(image_url)
+            if img_bytes:
+                img_source = "Amazon API"
+            else:
+                logger.warning(f"Amazon API image download failed for: {image_url}")
+
+        # Apply watermark
+        if img_bytes and wm_enabled:
+            img_bytes = apply_watermark(img_bytes, wm_text)
 
         await wait_msg.delete()
 
-        # Post to channel
+        # ── Post to channel ────────────────────────────────────────────────
         try:
-            if has_photo:
-                await context.bot.copy_message(
-                    chat_id=channel,
-                    from_chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                    caption=caption_html,
-                    parse_mode="HTML",
-                    reply_markup=final_markup,
-                )
-            elif image_url:
+            if img_bytes:
                 await context.bot.send_photo(
                     chat_id=channel,
-                    photo=image_url,
+                    photo=InputFile(io.BytesIO(img_bytes), filename="deal.jpg"),
                     caption=caption_html,
                     parse_mode="HTML",
                     reply_markup=final_markup,
@@ -486,28 +607,31 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if title:
                 mark_posted(title)
 
-            reply_lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
+            # ── Admin reply ────────────────────────────────────────────────
+            lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
             if api_note:
-                reply_lines.append(api_note)
-            reply_lines.append(f"\n📢 Posted to: <code>{html_lib.escape(channel)}</code>")
-            await msg.reply_text("\n".join(reply_lines), parse_mode="HTML", disable_web_page_preview=True)
+                lines.append(api_note)
+            if img_bytes:
+                wm_tag = " + Watermark ✅" if wm_enabled else ""
+                lines.append(f"🖼️ Image: {img_source}{wm_tag}")
+            else:
+                lines.append("🖼️ Image nahi mili — sirf text post kiya.")
+            lines.append(f"📢 <code>{html_lib.escape(channel)}</code>")
+            await msg.reply_text(
+                "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+            )
 
         except Exception as e:
             await msg.reply_text(
-                f"❌ <b>Post nahi ho saka!</b>\n<code>{html_lib.escape(str(e))}</code>",
+                f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
                 parse_mode="HTML"
             )
         return
 
     # ==========================================================================
-    # CASE 2: Multiple links or non-Amazon — normal post with affiliate links
+    # CASE C: Non-Amazon message
     # ==========================================================================
     cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
-
-    if has_amazon:
-        updated_plain = await replace_amazon_links(cleaned_plain, amazon_urls)
-    else:
-        updated_plain = cleaned_plain
 
     # Duplicate check
     dup_key = raw_plain.strip()[:300]
@@ -515,27 +639,77 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dup, dup_time = is_duplicate(dup_key)
         if dup:
             await msg.reply_text(
-                f"⚠️ <b>Yeh message {dup_time} already post ho chuka hai — skip kiya.</b>",
+                f"⚠️ <b>Duplicate!</b> Yeh message {dup_time} already post ho chuka hai — skip kiya.",
                 parse_mode="HTML"
             )
             return
 
-    GREETING   = "🙏Jai Shree Ram Dosto🙏\n\n"
-    body_html  = entities_to_html(updated_plain, cleaned_entities)
-    final_html = GREETING + body_html
+    body_html = entities_to_html(cleaned_plain, cleaned_entities)
 
-    # Post to channel
     try:
-        if msg.caption is not None:
+        if msg.photo:
+            # Download photo, apply watermark, post
+            img_bytes = await _get_photo_bytes(context.bot, msg)
+            if img_bytes and wm_enabled:
+                img_bytes = apply_watermark(img_bytes, wm_text)
+
+            final_caption = None
+            if raw_plain.strip():
+                final_caption = _safe_truncate(
+                    "🙏Jai Shree Ram Dosto🙏\n\n" + body_html, 1020
+                )
+
+            if img_bytes:
+                await context.bot.send_photo(
+                    chat_id=channel,
+                    photo=InputFile(io.BytesIO(img_bytes), filename="post.jpg"),
+                    caption=final_caption,
+                    parse_mode="HTML" if final_caption else None,
+                    reply_markup=final_markup,
+                )
+            else:
+                # Could not download photo — copy original
+                await context.bot.copy_message(
+                    chat_id=channel,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    caption=final_caption,
+                    parse_mode="HTML" if final_caption else None,
+                    reply_markup=final_markup,
+                )
+
+            wm_tag = " + Watermark ✅" if (wm_enabled and img_bytes) else ""
+            await msg.reply_text(
+                f"✅ <b>Post ho gaya!</b>\n"
+                f"🖼️ Photo ke saath{wm_tag}.\n"
+                f"📢 <code>{html_lib.escape(channel)}</code>",
+                parse_mode="HTML"
+            )
+
+        elif msg.document or msg.video or msg.animation or msg.video_note:
+            # Media that can't be easily watermarked — copy as-is
+            final_caption = None
+            if raw_plain.strip():
+                final_caption = _safe_truncate(
+                    "🙏Jai Shree Ram Dosto🙏\n\n" + body_html, 1020
+                )
             await context.bot.copy_message(
                 chat_id=channel,
                 from_chat_id=msg.chat_id,
                 message_id=msg.message_id,
-                caption=final_html,
-                parse_mode="HTML",
+                caption=final_caption,
+                parse_mode="HTML" if final_caption else None,
                 reply_markup=final_markup,
             )
-        elif msg.text:
+            await msg.reply_text(
+                f"✅ <b>Post ho gaya!</b>\n"
+                f"📢 <code>{html_lib.escape(channel)}</code>",
+                parse_mode="HTML"
+            )
+
+        else:
+            # Text only
+            final_html = "🙏Jai Shree Ram Dosto🙏\n\n" + body_html
             await context.bot.send_message(
                 chat_id=channel,
                 text=final_html,
@@ -543,26 +717,18 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=final_markup,
             )
-        else:
-            await context.bot.copy_message(
-                chat_id=channel,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-                reply_markup=final_markup,
+            await msg.reply_text(
+                f"✅ <b>Post ho gaya!</b>\n"
+                f"📢 <code>{html_lib.escape(channel)}</code>",
+                parse_mode="HTML"
             )
 
         if dup_key:
             mark_posted(dup_key)
 
-        await msg.reply_text(
-            f"✅ <b>Post Ho Gaya!</b>\n📢 <code>{html_lib.escape(channel)}</code>",
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-
     except Exception as e:
         await msg.reply_text(
-            f"❌ <b>Post nahi ho saka!</b>\n<code>{html_lib.escape(str(e))}</code>",
+            f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
             parse_mode="HTML"
         )
 
@@ -578,6 +744,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
+    # ── Cancel ────────────────────────────────────────────────────────────
     if data == "cancel":
         context.user_data.clear()
         try:
@@ -586,7 +753,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # /setbutton callbacks
+    # ── Watermark callbacks ────────────────────────────────────────────────
+    if data == "wm_toggle":
+        cfg = load_config()
+        wm  = cfg.setdefault("watermark", {"enabled": True, "text": "@DealKoti"})
+        wm["enabled"] = not wm.get("enabled", True)
+        cfg["watermark"] = wm
+        save_config(cfg)
+        try:
+            await query.edit_message_text(
+                _watermark_status_text(wm),
+                parse_mode="HTML",
+                reply_markup=_watermark_kb(wm)
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "wm_set_text":
+        context.user_data["action"] = "wm_wait_text"
+        try:
+            await query.edit_message_text(
+                "✏️ <b>Watermark Text Set Karo</b>\n\n"
+                "Naya watermark text type karo (max 30 characters):",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "wm_confirm_text":
+        new_text = context.user_data.pop("wm_pending_text", None)
+        context.user_data.pop("action", None)
+        if new_text:
+            cfg = load_config()
+            wm  = cfg.setdefault("watermark", {"enabled": True, "text": "@DealKoti"})
+            wm["text"] = new_text
+            cfg["watermark"] = wm
+            save_config(cfg)
+        try:
+            await query.edit_message_text(
+                f"✅ <b>Watermark text set ho gaya!</b>\n\n"
+                f"Text: <code>{html_lib.escape(new_text or '@DealKoti')}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    # ── /setbutton callbacks ───────────────────────────────────────────────
     if data == "sb_main":
         cfg     = load_config()
         buttons = cfg.get("buttons", {})
@@ -641,7 +856,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sb_btn_key"] = btn_key
         try:
             await query.edit_message_text(
-                f"📝 <b>Button {btn_key[-1]}</b> ka naya naam type karo:\n(max 20 characters)",
+                f"📝 <b>Button {btn_key[-1]}</b> ka naya naam type karo (max 20 characters):",
                 parse_mode="HTML"
             )
         except Exception:
@@ -654,7 +869,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sb_btn_key"] = btn_key
         try:
             await query.edit_message_text(
-                f"🔗 <b>Button {btn_key[-1]}</b> ka link type karo:\n(https:// ya t.me/ se shuru hona chahiye)",
+                f"🔗 <b>Button {btn_key[-1]}</b> ka link type karo\n"
+                f"(https:// ya t.me/ se shuru hona chahiye):",
                 parse_mode="HTML"
             )
         except Exception:
@@ -664,7 +880,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("sb_btn1_confirm", "sb_btn2_confirm"):
         btn_key  = data.split("_")[1]
         new_val  = context.user_data.pop(f"sb_{btn_key}_pending", None)
-        field    = context.user_data.pop(f"sb_{btn_key}_field",   None)
+        field    = context.user_data.pop(f"sb_{btn_key}_field", None)
         context.user_data.pop("action", None)
         cfg      = load_config()
         buttons  = cfg.setdefault("buttons", {})
@@ -688,7 +904,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("sb_btn1_cancel_edit", "sb_btn2_cancel_edit"):
         btn_key = data.split("_")[1]
         context.user_data.pop(f"sb_{btn_key}_pending", None)
-        context.user_data.pop(f"sb_{btn_key}_field",   None)
+        context.user_data.pop(f"sb_{btn_key}_field", None)
         context.user_data.pop("action", None)
         btn = load_config().get("buttons", {}).get(btn_key, {})
         try:
@@ -703,7 +919,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# TEXT INPUT HANDLER (multi-step flows)
+# TEXT INPUT HANDLER
 # =============================================================================
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -725,8 +941,25 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config(cfg)
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ Channel set ho gaya!\n📢 <code>{html_lib.escape(text)}</code>",
+            f"✅ <b>Channel set ho gaya!</b>\n📢 <code>{html_lib.escape(text)}</code>",
             parse_mode="HTML"
+        )
+        return
+
+    # /watermark text flow
+    if action == "wm_wait_text":
+        if len(text) > 30:
+            await update.message.reply_text("⚠️ Max 30 characters hone chahiye.")
+            return
+        context.user_data["wm_pending_text"] = text
+        context.user_data["action"] = None
+        await update.message.reply_text(
+            f"📋 <b>Preview:</b>\n\nWatermark text: <code>{html_lib.escape(text)}</code>\n\nSave karo?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Save",    callback_data="wm_confirm_text"),
+                InlineKeyboardButton("❌ Cancel",  callback_data="cancel"),
+            ]])
         )
         return
 
@@ -790,12 +1023,13 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_help))
-    app.add_handler(CommandHandler("status",      cmd_status))
-    app.add_handler(CommandHandler("setchannel",  cmd_setchannel))
-    app.add_handler(CommandHandler("setbutton",   cmd_setbutton))
-    app.add_handler(CommandHandler("testamz",     cmd_testamz))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("help",         cmd_help))
+    app.add_handler(CommandHandler("status",       cmd_status))
+    app.add_handler(CommandHandler("setchannel",   cmd_setchannel))
+    app.add_handler(CommandHandler("watermark",    cmd_watermark))
+    app.add_handler(CommandHandler("setbutton",    cmd_setbutton))
+    app.add_handler(CommandHandler("testamz",      cmd_testamz))
     app.add_handler(CommandHandler("exportconfig", cmd_exportconfig))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
