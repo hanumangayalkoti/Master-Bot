@@ -15,6 +15,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DEFAULT_CONFIG = {
     "channel": "",
     "source_channel": "",
+    "silent": True,
     "watermark": {
         "enabled": True,
         "text": "@DealKoti",
@@ -76,6 +77,7 @@ def load_config() -> dict:
             cfg = json.loads(row[0])
             cfg.setdefault("channel", "")
             cfg.setdefault("source_channel", "")
+            cfg.setdefault("silent", True)
             cfg.setdefault("watermark", DEFAULT_CONFIG["watermark"].copy())
             cfg.setdefault("buttons",   DEFAULT_CONFIG["buttons"].copy())
             return cfg
