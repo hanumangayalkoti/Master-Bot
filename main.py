@@ -5,6 +5,7 @@ import html as html_lib
 import asyncio
 import logging
 import aiohttp
+from collections import deque
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
@@ -39,6 +40,11 @@ except ValueError:
 MULTI_POST_DELAY = 3.0
 MAX_PRODUCTS_PER_MESSAGE = 15
 
+# Invisible marker — bot jo status message draft channel mein daalta hai uske
+# aakhir mein lagta hai, taaki bot apne hi message ko dobara na uthaye.
+# U+2063 INVISIBLE SEPARATOR — screen pe kuch dikhta nahi.
+SELF_MARKER = "\u2063"
+
 URL_REGEX = re.compile(r"(https?://[^\s\]\[<>\"']+)")
 
 FOOTER_LINE_PATTERN = re.compile(
@@ -51,6 +57,38 @@ FOOTER_LINE_PATTERN = re.compile(
 
 # Channels we've already offered to set as source (avoid DM spam)
 _offered_channels = set()
+
+# Bot ne khud jo messages channel mein bheje unki IDs (loop guard)
+_own_msg_ids = deque(maxlen=1000)
+_own_msg_set = set()
+
+
+def _remember_own(m):
+    """Bot ke apne channel message ko yaad rakho taaki dobara process na ho."""
+    if not m:
+        return m
+    try:
+        key = (m.chat_id, m.message_id)
+    except Exception:
+        return m
+    if len(_own_msg_ids) == _own_msg_ids.maxlen:
+        _own_msg_set.discard(_own_msg_ids[0])
+    _own_msg_ids.append(key)
+    _own_msg_set.add(key)
+    return m
+
+
+def _is_own_message(msg, bot_id) -> bool:
+    """Teen tarah se check karo ki ye message bot ne khud to nahi bheja."""
+    if msg.from_user and msg.from_user.id == bot_id:
+        return True
+    try:
+        if (msg.chat_id, msg.message_id) in _own_msg_set:
+            return True
+    except Exception:
+        pass
+    body = msg.text or msg.caption or ""
+    return SELF_MARKER in body
 
 
 # =============================================================================
@@ -97,7 +135,7 @@ async def _get_photo_bytes(bot, msg) -> bytes | None:
 
 
 # =============================================================================
-# CHANNEL MATCHING / ADMIN NOTIFY HELPERS
+# CHANNEL MATCHING / NOTIFY HELPERS
 # =============================================================================
 def chat_matches(chat, ident: str) -> bool:
     """Check if a Telegram chat matches a stored identifier (@name or -100...)."""
@@ -136,7 +174,7 @@ async def _edit_or_notify(wait_msg, notify, text, **kwargs):
     """Edit the 'please wait' message if possible, else send a fresh one."""
     if wait_msg:
         try:
-            await wait_msg.edit_text(text, **kwargs)
+            await wait_msg.edit_text(text + SELF_MARKER, **kwargs)
             return
         except Exception:
             pass
@@ -401,8 +439,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>DealsKoti Bot chalu hai!</b>\n\n"
         "Do tarike se kaam karta hai:\n"
-        "1️⃣ Mujhe seedha deal ka message bhejo\n"
-        "2️⃣ Ya draft channel mein post karo — main khud uthaake bhej dunga\n\n"
+        "1️⃣ Mujhe seedha deal ka message bhejo — reply yahin milega\n"
+        "2️⃣ Ya draft channel mein post karo — reply wahin milega\n\n"
         "Ek message mein kitne bhi Amazon links daal sakte ho — "
         "har product ki <b>alag post</b> jayegi.\n\n"
         "/help daao saare commands dekhne ke liye.",
@@ -432,7 +470,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 1 Amazon product link → full deal post (price, rating, image)\n"
         "• Kai Amazon links → <b>har product ki alag post</b>\n"
         "• Search / deals / storefront page → ignore\n"
-        "• Non-Amazon message → jaisa ka waisa forward",
+        "• Non-Amazon message → jaisa ka waisa forward\n\n"
+        "<b>💬 Status reply kahan aayega</b>\n"
+        "• DM se bheja → DM mein\n"
+        "• Draft channel se → usi post ke reply mein",
         parse_mode="HTML"
     )
 
@@ -501,7 +542,8 @@ async def cmd_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📥 <b>Draft Channel Set Karo</b>\n\n"
         f"Current: <code>{html_lib.escape(current)}</code>\n\n"
         f"<b>Pehle ye karo:</b>\n"
-        f"1. Draft channel mein mujhe <b>admin</b> banao\n"
+        f"1. Draft channel mein mujhe <b>admin</b> banao "
+        f"(post karne ki permission ke saath — status reply wahin bhejta hoon)\n"
         f"2. Phir yahan channel ID type karo (@mydraft ya -100123456789)\n\n"
         f"<i>Tip: agar ID nahi pata to bas draft channel mein koi bhi post daal do — "
         f"main khud yahan ID bhej dunga ek button ke saath.</i>",
@@ -646,7 +688,7 @@ async def classify_amazon_urls(urls: list) -> dict:
 async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_text):
     """
     Ek Amazon product ko channel pe post karo.
-    Returns (status, detail):
+    Returns (status, detail, img_source):
       "posted"    — ho gaya, detail = title
       "duplicate" — pehle ja chuki, detail = "title — X ghante pehle"
       "nodata"    — API se data nahi mila, detail = affiliate link
@@ -662,13 +704,13 @@ async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_tex
         product = None
 
     if not product or not product.get("title"):
-        return "nodata", short_link
+        return "nodata", short_link, ""
 
     title = product["title"]
 
     dup, dup_time = is_duplicate(title)
     if dup:
-        return "duplicate", f"{title[:60]} — {dup_time}"
+        return "duplicate", f"{title[:60]} — {dup_time}", ""
 
     caption_html = build_amazon_caption(product, short_link)
 
@@ -682,6 +724,11 @@ async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_tex
             logger.warning(f"Amazon image download fail: {image_url[:80]}")
     if img_bytes and wm_enabled:
         img_bytes = apply_watermark(img_bytes, wm_text)
+
+    if img_bytes:
+        img_source = "Amazon API" + (" + Watermark ✅" if wm_enabled else "")
+    else:
+        img_source = ""
 
     try:
         if img_bytes:
@@ -701,10 +748,10 @@ async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_tex
                 reply_markup=markup,
             )
         mark_posted(title)
-        return "posted", title
+        return "posted", title, img_source
     except Exception as e:
         logger.error(f"Post fail {asin}: {e}")
-        return "error", str(e)
+        return "error", str(e), ""
 
 
 # =============================================================================
@@ -713,7 +760,8 @@ async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_tex
 async def process_and_post(context, msg, notify, config=None, source_tag: str = ""):
     """
     msg     — the incoming Telegram message (DM message OR channel post)
-    notify  — async callable(text, **kwargs) used for all admin status replies
+    notify  — async callable(text, **kwargs); DM se aaya to DM mein reply,
+              draft channel se aaya to usi post ke reply mein.
     """
     # ── Parse message content ──────────────────────────────────────────────
     if msg.caption is not None:
@@ -800,13 +848,16 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
             wait_msg = None
 
             posted, dupes, nodata, errors = [], [], [], []
+            img_note = ""
 
             for i, item in enumerate(products):
-                status, detail = await post_amazon_product(
+                status, detail, img_source = await post_amazon_product(
                     context, item, channel, final_markup, wm_enabled, wm_text
                 )
                 if status == "posted":
                     posted.append(detail)
+                    if not img_note:
+                        img_note = img_source
                 elif status == "duplicate":
                     dupes.append(detail)
                 elif status == "nodata":
@@ -849,12 +900,29 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                     )
                 return
 
-            # ── Summary ────────────────────────────────────────────────────
+            # ── Single product success → purana wala short reply ───────────
+            if total == 1 and len(posted) == 1:
+                lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
+                if img_note:
+                    lines.append(f"🖼️ Image: {img_note}")
+                else:
+                    lines.append("🖼️ Image nahi mili — sirf text post kiya.")
+                lines.append(f"📢 <code>{html_lib.escape(channel)}</code>")
+                if source_tag:
+                    lines.append(source_tag.strip())
+                await notify(
+                    "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+                )
+                return
+
+            # ── Summary (multi ya mixed) ───────────────────────────────────
             lines = []
             if posted:
                 lines.append(f"✅ <b>{len(posted)} deal post ho gayi!</b>")
                 for t in posted[:10]:
                     lines.append(f"   • {html_lib.escape(t[:55])}")
+                if img_note:
+                    lines.append(f"🖼️ Image: {img_note}")
             else:
                 lines.append("⚠️ <b>Koi deal post nahi hui.</b>")
             if dupes:
@@ -1013,7 +1081,7 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
 
 
 # =============================================================================
-# ENTRY POINT 1 — Admin DM
+# ENTRY POINT 1 — Admin DM (reply DM mein)
 # =============================================================================
 async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
@@ -1031,14 +1099,14 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             return await msg.reply_text(text, **kwargs)
         except Exception as e:
-            logger.error(f"Reply fail: {e}")
+            logger.error(f"DM reply fail: {e}")
             return None
 
     await process_and_post(context, msg, notify)
 
 
 # =============================================================================
-# ENTRY POINT 2 — Draft channel post
+# ENTRY POINT 2 — Draft channel post (reply usi channel mein)
 # =============================================================================
 async def _offer_source_setup(context, chat):
     """Unknown channel se post aayi — admin ko ID + button bhejo (ek hi baar)."""
@@ -1066,11 +1134,15 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not msg:
         return
 
+    # ── LOOP GUARD: bot ka apna status message dobara process na ho ────────
+    if _is_own_message(msg, context.bot.id):
+        return
+
     config = load_config()
     source = (config.get("source_channel") or "").strip()
     target = (config.get("channel") or "").strip()
 
-    # Apne hi post channel ko kabhi na uthao — warna infinite loop
+    # Apne hi post channel ko kabhi na uthao
     if target and chat_matches(msg.chat, target):
         return
 
@@ -1096,7 +1168,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     source_tag = f"\n📥 Source: <b>{html_lib.escape(src_name)}</b>"
 
     async def notify(text, **kwargs):
-        return await dm_admin(context, text, **kwargs)
+        """Status reply DRAFT CHANNEL mein hi, usi post ke reply ke roop mein."""
+        try:
+            sent = await msg.reply_text(text + SELF_MARKER, **kwargs)
+            return _remember_own(sent)
+        except Exception as e:
+            # Channel mein post permission nahi? To DM pe bhej do.
+            logger.error(f"Draft channel reply fail: {e} — DM pe bhej raha hoon")
+            return await dm_admin(context, text, **kwargs)
 
     logger.info(f"Draft channel post pakda: {msg.chat.id} / msg {msg.message_id}")
     await process_and_post(context, msg, notify, config=config, source_tag=source_tag)
@@ -1143,7 +1222,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>Draft channel set ho gaya!</b>\n"
                 f"📥 <code>{html_lib.escape(chat_id)}</code>\n\n"
                 f"Ab yahan jo bhi post karoge, wo automatically transform hoke "
-                f"post channel pe chali jayegi.",
+                f"post channel pe chali jayegi — aur status reply wahin milega.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -1368,7 +1447,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Draft channel set ho gaya!</b>\n"
             f"📥 <code>{html_lib.escape(text)}</code>\n\n"
             f"Ab yahan post karo — main khud uthaake transform karke "
-            f"post channel pe bhej dunga.\n\n"
+            f"post channel pe bhej dunga, aur status reply wahin dunga.\n\n"
             f"<i>Dhyan rakhna: bot ko is channel mein admin banana zaroori hai.</i>",
             parse_mode="HTML"
         )
@@ -1479,13 +1558,13 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Admin DM se message
+    # Admin DM se message → reply DM mein
     app.add_handler(MessageHandler(
         filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_deal
     ))
 
-    # Draft channel se auto pickup
+    # Draft channel se auto pickup → reply usi channel mein
     app.add_handler(MessageHandler(
         filters.UpdateType.CHANNEL_POST,
         handle_channel_post
