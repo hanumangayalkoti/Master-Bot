@@ -38,6 +38,21 @@ NEEDS_REDIRECT = (
     "link.amazon",
 )
 
+# Search / browse / listing page markers.
+# NOTE: ASIN check ALWAYS runs first — a product link that came out of a search
+# (…/dp/B0XXXX/ref=sr_1_1?keywords=shoes) is a product, not a search page.
+SEARCH_MARKERS = (
+    "/s?", "/s/", "/search",
+    "field-keywords", "keywords=", "k=",
+    "/b?", "/b/", "node=",
+    "/deals", "/gp/goldbox", "/goldbox",
+    "/gp/browse", "/gp/search",
+    "/gp/bestsellers", "/bestsellers", "/gp/new-releases", "/gp/movers-and-shakers",
+    "/stores/", "/shop/", "/brand/",
+    "/gcx/", "/events/", "/promotion", "/hz/",
+    "/gp/most-wished-for", "/international-shopping",
+)
+
 _token_cache: dict = {"token": None, "expires_at": None}
 
 PRODUCT_RESOURCES = [
@@ -107,6 +122,8 @@ async def _get_token() -> str | None:
 
 
 def extract_asin(url: str) -> str | None:
+    if not url:
+        return None
     url = url.strip()
     if re.fullmatch(r"[A-Za-z0-9]{10}", url):
         return url.upper()
@@ -117,29 +134,59 @@ def extract_asin(url: str) -> str | None:
     if q:
         return q.group(1).upper()
     # link.amazon/ASIN style: path segment that looks like ASIN
-    path = urllib.parse.urlparse(url).path.strip("/")
+    try:
+        path = urllib.parse.urlparse(url).path.strip("/")
+    except Exception:
+        return None
     if re.fullmatch(r"[A-Za-z0-9]{10}", path):
         return path.upper()
     return None
 
 
 def is_amazon_url(url: str) -> bool:
-    """Detect any Amazon-related URL including short links."""
+    """
+    Detect Amazon URLs including short links.
+    'amazon'/'amzn' must be a WHOLE domain label — so fakeamazon.xyz
+    aur amazon-deals.ru jaise fake domains pakde nahi jayenge.
+    """
     try:
-        host = urllib.parse.urlparse(url).netloc.lower()
-        # Standard amazon domains + short link domains
-        return (
-            "amazon" in host or
-            "amzn" in host or
-            host in ("a.co", "www.a.co")
-        )
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0].strip(".")
     except Exception:
         return False
+    if not host:
+        return False
+    if host in ("a.co", "www.a.co"):
+        return True
+    labels = host.split(".")
+    return any(lbl in ("amazon", "amzn") for lbl in labels)
 
 
 def is_amazon_search_url(url: str) -> bool:
-    markers = ["/s?", "/s/", "field-keywords", "/b?", "node=", "/deals", "/gp/browse"]
-    return any(m in url for m in markers)
+    """
+    Search / browse / deals / storefront page hai ya nahi.
+    IMPORTANT: caller ko pehle extract_asin() try karna chahiye — agar ASIN
+    mil gaya to wo product link hai, chahe usme search markers ho.
+    """
+    if not url:
+        return False
+    low = url.lower()
+    try:
+        parsed = urllib.parse.urlparse(low)
+        path   = parsed.path or ""
+        query  = parsed.query or ""
+    except Exception:
+        path, query = low, ""
+
+    for marker in SEARCH_MARKERS:
+        if marker.endswith("="):
+            if re.search(r"[?&]" + re.escape(marker), "?" + query):
+                return True
+        elif marker.startswith("/"):
+            if marker.rstrip("?") in path or marker in low:
+                return True
+        elif marker in low:
+            return True
+    return False
 
 
 def needs_redirect(url: str) -> bool:
@@ -177,6 +224,13 @@ async def _resolve_redirect(url: str) -> str:
                 return str(resp.url)
     except Exception:
         return url
+
+
+async def resolve_amazon_url(url: str) -> str:
+    """Short link ho to resolve karke asli URL do, warna waise hi."""
+    if needs_redirect(url):
+        return await _resolve_redirect(url)
+    return url
 
 
 async def get_short_affiliate_link(url: str) -> str:
@@ -300,9 +354,7 @@ async def get_product_by_asin(asin: str) -> dict | None:
 
 
 async def enrich_amazon_url(url: str) -> dict | None:
-    resolved = url
-    if needs_redirect(url):
-        resolved = await _resolve_redirect(url)
+    resolved = await resolve_amazon_url(url)
 
     asin = extract_asin(resolved)
     if not asin:
