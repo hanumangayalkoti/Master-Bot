@@ -2,6 +2,7 @@ import os
 import io
 import re
 import html as html_lib
+import asyncio
 import logging
 import aiohttp
 from telegram import (
@@ -12,8 +13,9 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 from amazon_api import (
-    is_amazon_url, is_amazon_search_url, enrich_amazon_url,
-    get_short_affiliate_link, _resolve_redirect, needs_redirect,
+    is_amazon_url, is_amazon_search_url, resolve_amazon_url,
+    extract_asin, get_product_by_asin, make_affiliate_url,
+    get_short_affiliate_link,
 )
 from caption import build_amazon_caption, _safe_truncate, _TAG_RE
 from database import is_duplicate, mark_posted, cleanup_old_entries
@@ -32,6 +34,10 @@ try:
 except ValueError:
     ADMIN_ID = 0
     logger.error("ADMIN_ID env var must be a number!")
+
+# Multi-product posts ke beech gap (Telegram flood limit se bachne ke liye)
+MULTI_POST_DELAY = 3.0
+MAX_PRODUCTS_PER_MESSAGE = 15
 
 URL_REGEX = re.compile(r"(https?://[^\s\]\[<>\"']+)")
 
@@ -60,15 +66,6 @@ def extract_urls(text: str) -> list:
 
 def get_amazon_urls(urls: list) -> list:
     return [u for u in urls if is_amazon_url(u)]
-
-
-async def replace_amazon_links(text: str, urls: list) -> str:
-    result = text
-    for url in urls:
-        if is_amazon_url(url):
-            short = await get_short_affiliate_link(url)
-            result = result.replace(url, short)
-    return result
 
 
 async def _download_image(url: str) -> bytes | None:
@@ -174,6 +171,75 @@ def _py_to_utf16_len(text: str) -> int:
     return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
 
 
+class _Ent:
+    """Lightweight stand-in for telegram.MessageEntity (which is immutable)."""
+    __slots__ = ("offset", "length", "type", "url")
+
+    def __init__(self, offset, length, type_, url=None):
+        self.offset = offset
+        self.length = length
+        self.type   = type_
+        self.url    = url
+
+
+def _clone_ent(ent, offset=None, length=None) -> _Ent:
+    return _Ent(
+        ent.offset if offset is None else offset,
+        ent.length if length is None else length,
+        ent.type,
+        getattr(ent, "url", None),
+    )
+
+
+def replace_url_keep_entities(text: str, entities: list, old_url: str, new_url: str):
+    """
+    Text mein old_url ko new_url se replace karo AUR entity offsets bhi
+    saath mein shift kar do — warna bold/link galat jagah lag jaate hain.
+    Returns (new_text, new_entities).
+    """
+    if not old_url or old_url == new_url:
+        return text, entities
+    idx = text.find(old_url)
+    if idx < 0:
+        return text, entities
+
+    start_u16 = _py_to_utf16_len(text[:idx])
+    old_u16   = _py_to_utf16_len(old_url)
+    new_u16   = _py_to_utf16_len(new_url)
+    end_u16   = start_u16 + old_u16
+    delta     = new_u16 - old_u16
+
+    new_text = text[:idx] + new_url + text[idx + len(old_url):]
+
+    new_ents = []
+    for ent in (entities or []):
+        s = ent.offset
+        e = ent.offset + ent.length
+        if e <= start_u16:
+            new_ents.append(_clone_ent(ent))                              # poora pehle
+        elif s >= end_u16:
+            new_ents.append(_clone_ent(ent, offset=s + delta))            # poora baad
+        elif s <= start_u16 and e >= end_u16:
+            new_ents.append(_clone_ent(ent, length=ent.length + delta))   # URL ko cover karta hai
+        else:
+            continue   # aadha overlap — drop, warna HTML toot jayega
+    return new_text, new_ents
+
+
+async def replace_amazon_links(text: str, entities: list, urls: list):
+    """Har Amazon link ko affiliate link se badlo, entities safe rakhte hue."""
+    for url in urls:
+        if not is_amazon_url(url):
+            continue
+        try:
+            short = await get_short_affiliate_link(url)
+        except Exception as e:
+            logger.error(f"Affiliate link banane mein fail: {e}")
+            continue
+        text, entities = replace_url_keep_entities(text, entities, url, short)
+    return text, entities
+
+
 def remove_footer(plain_text: str, entities: list):
     lines = plain_text.split('\n')
     while lines and not lines[-1].strip():
@@ -213,7 +279,7 @@ def entities_to_html(text: str, entities: list) -> str:
         e_utf16 = ent.offset + ent.length
         s = utf16_map[s_utf16] if s_utf16 < len(utf16_map) else s_utf16
         e = utf16_map[e_utf16] if e_utf16 < len(utf16_map) else e_utf16
-        if e > len(text):
+        if e > len(text) or s >= len(text) or e <= s:
             continue
         etype = ent.type
 
@@ -337,7 +403,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Do tarike se kaam karta hai:\n"
         "1️⃣ Mujhe seedha deal ka message bhejo\n"
         "2️⃣ Ya draft channel mein post karo — main khud uthaake bhej dunga\n\n"
-        "/help daao sare commands dekhne ke liye.",
+        "Ek message mein kitne bhi Amazon links daal sakte ho — "
+        "har product ki <b>alag post</b> jayegi.\n\n"
+        "/help daao saare commands dekhne ke liye.",
         parse_mode="HTML"
     )
 
@@ -346,20 +414,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        "📖 <b>DealsKoti Bot — Sare Commands</b>\n\n"
+        "📖 <b>DealsKoti Bot — Saare Commands</b>\n\n"
+        "ℹ️ /start — Bot ki info\n"
+        "📖 /help — Ye list\n"
         "📊 /status — Channel, watermark aur buttons ka status\n"
         "📢 /setchannel — Post karne wala channel set karo\n"
         "📥 /setsource — Draft channel set karo (auto pickup)\n"
-        "🖼️ /watermark — Watermark settings (on/off + text)\n"
+        "🖼️ /watermark — Watermark settings (ON/OFF + text)\n"
         "🎛️ /setbutton — Post ke neeche buttons set karo\n"
-        "🧪 /testamz — Amazon API test karo\n"
-        "💾 /exportconfig — Config backup karo\n"
-        "ℹ️ /start — Bot ki info\n\n"
-        "<b>Watermark shortcuts:</b>\n"
-        "/watermark on — ON karo\n"
-        "/watermark off — OFF karo\n\n"
-        "<b>Draft channel shortcut:</b>\n"
-        "/setsource off — Auto pickup band karo",
+        "🧪 /testamz — Amazon Creators API test karo\n"
+        "💾 /exportconfig — Config ka JSON backup\n\n"
+        "<b>⚡ Shortcuts</b>\n"
+        "<code>/watermark on</code> — Watermark ON\n"
+        "<code>/watermark off</code> — Watermark OFF\n"
+        "<code>/setsource off</code> — Auto pickup band\n\n"
+        "<b>📌 Kaise kaam karta hai</b>\n"
+        "• 1 Amazon product link → full deal post (price, rating, image)\n"
+        "• Kai Amazon links → <b>har product ki alag post</b>\n"
+        "• Search / deals / storefront page → ignore\n"
+        "• Non-Amazon message → jaisa ka waisa forward",
         parse_mode="HTML"
     )
 
@@ -490,14 +563,13 @@ async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔄 Amazon Creators API test ho rahi hai...")
     try:
-        from amazon_api import get_product_by_asin, make_affiliate_url
         test_asin = "B08N5WRWNW"
         product   = await get_product_by_asin(test_asin)
         short     = make_affiliate_url(test_asin)
         if product and product.get("title"):
             await update.message.reply_text(
                 f"✅ <b>Amazon Creators API kaam kar raha hai!</b>\n\n"
-                f"🏷️ Title   : <code>{product['title'][:80]}</code>\n"
+                f"🏷️ Title   : <code>{html_lib.escape(product['title'][:80])}</code>\n"
                 f"💰 Price   : <b>{product.get('deal_price', 'N/A')}</b>\n"
                 f"📉 Discount: <b>{product.get('discount_pct', 0)}%</b>\n"
                 f"⭐ Rating  : <b>{product.get('rating', 'N/A')}</b>\n"
@@ -532,6 +604,110 @@ async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
+# AMAZON LINK CLASSIFICATION
+# =============================================================================
+async def classify_amazon_urls(urls: list) -> dict:
+    """
+    Har Amazon URL ko resolve karke teen buckets mein daalo:
+      products — ASIN mil gaya (ASIN se dedup)
+      searches — search / deals / browse / storefront page
+      unknown  — Amazon ka hai par ASIN nahi mila aur search bhi nahi lagta
+
+    ASIN check PEHLE hota hai — kyunki search se nikla product link
+    (.../dp/B0XXXX/ref=sr_1_1?keywords=shoes) product hai, search page nahi.
+    """
+    products, searches, unknown = [], [], []
+    seen_asins = set()
+
+    for url in urls:
+        try:
+            resolved = await resolve_amazon_url(url)
+        except Exception as e:
+            logger.error(f"Redirect resolve fail ({url[:60]}): {e}")
+            resolved = url
+
+        asin = extract_asin(resolved) or extract_asin(url)
+        if asin:
+            if asin in seen_asins:
+                continue
+            seen_asins.add(asin)
+            products.append({"url": url, "resolved": resolved, "asin": asin})
+        elif is_amazon_search_url(resolved) or is_amazon_search_url(url):
+            searches.append(url)
+        else:
+            unknown.append(url)
+
+    return {"products": products, "searches": searches, "unknown": unknown}
+
+
+# =============================================================================
+# SINGLE PRODUCT POSTER — ek ASIN ki ek post
+# =============================================================================
+async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_text):
+    """
+    Ek Amazon product ko channel pe post karo.
+    Returns (status, detail):
+      "posted"    — ho gaya, detail = title
+      "duplicate" — pehle ja chuki, detail = "title — X ghante pehle"
+      "nodata"    — API se data nahi mila, detail = affiliate link
+      "error"     — post fail, detail = error text
+    """
+    asin       = item["asin"]
+    short_link = make_affiliate_url(asin)
+
+    try:
+        product = await get_product_by_asin(asin)
+    except Exception as e:
+        logger.error(f"API fail {asin}: {e}")
+        product = None
+
+    if not product or not product.get("title"):
+        return "nodata", short_link
+
+    title = product["title"]
+
+    dup, dup_time = is_duplicate(title)
+    if dup:
+        return "duplicate", f"{title[:60]} — {dup_time}"
+
+    caption_html = build_amazon_caption(product, short_link)
+
+    # ONLY Amazon API image — NEVER original post photo
+    # (original mein doosre channel ka watermark ho sakta hai)
+    img_bytes = None
+    image_url = product.get("image_url", "")
+    if image_url:
+        img_bytes = await _download_image(image_url)
+        if not img_bytes:
+            logger.warning(f"Amazon image download fail: {image_url[:80]}")
+    if img_bytes and wm_enabled:
+        img_bytes = apply_watermark(img_bytes, wm_text)
+
+    try:
+        if img_bytes:
+            await context.bot.send_photo(
+                chat_id=channel,
+                photo=InputFile(io.BytesIO(img_bytes), filename="deal.jpg"),
+                caption=caption_html,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=channel,
+                text=caption_html,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
+        mark_posted(title)
+        return "posted", title
+    except Exception as e:
+        logger.error(f"Post fail {asin}: {e}")
+        return "error", str(e)
+
+
+# =============================================================================
 # CORE PROCESSOR — same logic for DM messages and draft-channel posts
 # =============================================================================
 async def process_and_post(context, msg, notify, config=None, source_tag: str = ""):
@@ -555,7 +731,6 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
 
     all_urls    = extract_urls(raw_plain)
     amazon_urls = get_amazon_urls(all_urls)
-    has_amazon  = len(amazon_urls) > 0
 
     if not raw_plain.strip() and not all_urls and not has_photo:
         await notify("⚠️ Message mein koi text ya link nahi mila.")
@@ -583,13 +758,136 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
         pass
 
     # ==========================================================================
-    # CASE A: Multiple Amazon links → text only, no image
+    # AMAZON PATH
     # ==========================================================================
-    if has_amazon and len(amazon_urls) > 1:
+    if amazon_urls:
+        wait_msg = await notify("⏳ Amazon links check ho rahe hain...")
+
+        buckets  = await classify_amazon_urls(amazon_urls)
+        products = buckets["products"]
+        searches = buckets["searches"]
+        unknown  = buckets["unknown"]
+
+        # ── Koi product nahi, sirf search/deals pages → poora ignore ───────
+        if not products and not unknown:
+            await _edit_or_notify(
+                wait_msg, notify,
+                f"🚫 <b>Skip!</b> Sirf Amazon search/deals page mile "
+                f"({len(searches)} link) — kuch bhi post nahi kiya.\n"
+                f"Specific product ke link bhejo.",
+                parse_mode="HTML"
+            )
+            return
+
+        # ── Products mile → har ek ki ALAG post ────────────────────────────
+        if products:
+            if len(products) > MAX_PRODUCTS_PER_MESSAGE:
+                await notify(
+                    f"⚠️ {len(products)} products mile — sirf pehle "
+                    f"{MAX_PRODUCTS_PER_MESSAGE} post kar raha hoon."
+                )
+                products = products[:MAX_PRODUCTS_PER_MESSAGE]
+
+            total = len(products)
+            if total > 1:
+                await _edit_or_notify(
+                    wait_msg, notify,
+                    f"⏳ <b>{total} Amazon products</b> mile — alag alag post kar raha hoon...",
+                    parse_mode="HTML"
+                )
+            else:
+                await _delete_quiet(wait_msg)
+            wait_msg = None
+
+            posted, dupes, nodata, errors = [], [], [], []
+
+            for i, item in enumerate(products):
+                status, detail = await post_amazon_product(
+                    context, item, channel, final_markup, wm_enabled, wm_text
+                )
+                if status == "posted":
+                    posted.append(detail)
+                elif status == "duplicate":
+                    dupes.append(detail)
+                elif status == "nodata":
+                    nodata.append(detail)
+                else:
+                    errors.append(detail)
+
+                if i < total - 1:
+                    await asyncio.sleep(MULTI_POST_DELAY)
+
+            # ── Single product + API fail → purana fallback (text post) ────
+            if total == 1 and not posted and nodata:
+                short_link = nodata[0]
+                amazon_url = products[0]["url"]
+                cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
+                cleaned_plain, cleaned_entities = replace_url_keep_entities(
+                    cleaned_plain, cleaned_entities, amazon_url, short_link
+                )
+                body_html    = entities_to_html(cleaned_plain, cleaned_entities)
+                caption_html = _safe_truncate("🙏Jai Shree Ram Dosto🙏\n\n" + body_html, 1020)
+                try:
+                    await context.bot.send_message(
+                        chat_id=channel,
+                        text=caption_html,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=final_markup,
+                    )
+                    await notify(
+                        "✅ <b>Post ho gaya!</b>\n"
+                        "⚠️ Amazon API se product data nahi mila — "
+                        "original text affiliate link ke saath post kar diya.\n"
+                        f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
+                        parse_mode="HTML", disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    await notify(
+                        f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
+                        parse_mode="HTML"
+                    )
+                return
+
+            # ── Summary ────────────────────────────────────────────────────
+            lines = []
+            if posted:
+                lines.append(f"✅ <b>{len(posted)} deal post ho gayi!</b>")
+                for t in posted[:10]:
+                    lines.append(f"   • {html_lib.escape(t[:55])}")
+            else:
+                lines.append("⚠️ <b>Koi deal post nahi hui.</b>")
+            if dupes:
+                lines.append(f"\n🔁 <b>{len(dupes)} duplicate skip:</b>")
+                for d in dupes[:5]:
+                    lines.append(f"   • {html_lib.escape(d)}")
+            if nodata:
+                lines.append(f"\n⚠️ <b>{len(nodata)} ka Amazon data nahi mila</b> — skip kiya.")
+            if errors:
+                lines.append(f"\n❌ <b>{len(errors)} post fail:</b>")
+                for e in errors[:3]:
+                    lines.append(f"   • {html_lib.escape(e[:80])}")
+            if searches:
+                lines.append(f"\n🚫 {len(searches)} search/deals page ignore kiye.")
+            if unknown:
+                lines.append(f"\n❓ {len(unknown)} Amazon link se product pehchan nahi paya.")
+            lines.append(f"\n📢 <code>{html_lib.escape(channel)}</code>")
+            if source_tag:
+                lines.append(source_tag.strip())
+
+            await notify(
+                "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+            )
+            return
+
+        # ── Sirf unknown Amazon links (ASIN nahi mila, search bhi nahi) ────
+        await _delete_quiet(wait_msg)
         cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
-        updated_plain = await replace_amazon_links(cleaned_plain, amazon_urls)
-        body_html  = entities_to_html(updated_plain, cleaned_entities)
-        final_html = "🙏Jai Shree Ram Dosto🙏\n\n" + body_html
+        cleaned_plain, cleaned_entities = await replace_amazon_links(
+            cleaned_plain, cleaned_entities, unknown
+        )
+        body_html  = entities_to_html(cleaned_plain, cleaned_entities)
+        final_html = _safe_truncate("🙏Jai Shree Ram Dosto🙏\n\n" + body_html, 3800)
         try:
             await context.bot.send_message(
                 chat_id=channel,
@@ -598,11 +896,14 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                 disable_web_page_preview=True,
                 reply_markup=final_markup,
             )
+            note = f"\n🚫 {len(searches)} search page ignore kiye." if searches else ""
             await notify(
                 "✅ <b>Post ho gaya!</b>\n"
-                "⚠️ Multiple Amazon links thi — bina image ke text post kar di."
-                + source_tag,
-                parse_mode="HTML"
+                "⚠️ Amazon product link pehchan nahi paya — "
+                "text post kar diya affiliate link ke saath."
+                + note
+                + f"\n📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
+                parse_mode="HTML", disable_web_page_preview=True
             )
         except Exception as e:
             await notify(
@@ -612,117 +913,7 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
         return
 
     # ==========================================================================
-    # CASE B: Single Amazon link → full enrichment + image + watermark
-    # ==========================================================================
-    if has_amazon and len(amazon_urls) == 1:
-        amazon_url = amazon_urls[0]
-
-        resolved_url = amazon_url
-        if needs_redirect(amazon_url):
-            resolved_url = await _resolve_redirect(amazon_url)
-
-        if is_amazon_search_url(resolved_url):
-            await notify(
-                "🚫 <b>Skip!</b> Amazon search page tha — post nahi kiya.\n"
-                "Specific product ka link bhejo.",
-                parse_mode="HTML"
-            )
-            return
-
-        wait_msg = await notify("⏳ Amazon product data fetch ho raha hai...")
-
-        product    = await enrich_amazon_url(amazon_url)
-        short_link = await get_short_affiliate_link(amazon_url)
-
-        # ── Build caption ──────────────────────────────────────────────────
-        if product and product.get("title"):
-            title = product["title"]
-            dup, dup_time = is_duplicate(title)
-            if dup:
-                await _edit_or_notify(
-                    wait_msg, notify,
-                    f"⚠️ <b>Duplicate!</b> Yeh deal {dup_time} already post ho chuki hai — skip kiya.\n"
-                    f"🏷️ {html_lib.escape(title[:80])}",
-                    parse_mode="HTML"
-                )
-                return
-            caption_html = build_amazon_caption(product, short_link)
-            image_url    = product.get("image_url", "")
-            api_note     = ""
-        else:
-            title        = None
-            image_url    = ""
-            api_note     = "⚠️ Amazon API se product data nahi mila."
-            cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
-            body_html    = entities_to_html(cleaned_plain, cleaned_entities)
-            esc_url      = html_lib.escape(amazon_url)
-            body_html    = body_html.replace(esc_url, f'<a href="{short_link}">{short_link}</a>')
-            caption_html = _safe_truncate("🙏Jai Shree Ram Dosto🙏\n\n" + body_html, 1020)
-
-        # ── Get image bytes ────────────────────────────────────────────────
-        img_bytes  = None
-        img_source = ""
-
-        # ONLY Amazon API image — NEVER use original post photo for Amazon posts
-        # (original post may have another channel's watermark already embedded)
-        if image_url:
-            img_bytes = await _download_image(image_url)
-            if img_bytes:
-                img_source = "Amazon API"
-            else:
-                logger.warning(f"Amazon API image download failed for: {image_url}")
-
-        if img_bytes and wm_enabled:
-            img_bytes = apply_watermark(img_bytes, wm_text)
-
-        await _delete_quiet(wait_msg)
-
-        # ── Post to channel ────────────────────────────────────────────────
-        try:
-            if img_bytes:
-                await context.bot.send_photo(
-                    chat_id=channel,
-                    photo=InputFile(io.BytesIO(img_bytes), filename="deal.jpg"),
-                    caption=caption_html,
-                    parse_mode="HTML",
-                    reply_markup=final_markup,
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=channel,
-                    text=caption_html,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=final_markup,
-                )
-
-            if title:
-                mark_posted(title)
-
-            lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
-            if api_note:
-                lines.append(api_note)
-            if img_bytes:
-                wm_tag = " + Watermark ✅" if wm_enabled else ""
-                lines.append(f"🖼️ Image: {img_source}{wm_tag}")
-            else:
-                lines.append("🖼️ Image nahi mili — sirf text post kiya.")
-            lines.append(f"📢 <code>{html_lib.escape(channel)}</code>")
-            if source_tag:
-                lines.append(source_tag.strip())
-            await notify(
-                "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
-            )
-
-        except Exception as e:
-            await notify(
-                f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
-                parse_mode="HTML"
-            )
-        return
-
-    # ==========================================================================
-    # CASE C: Non-Amazon message
+    # NON-AMAZON MESSAGE
     # ==========================================================================
     cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
 
@@ -822,7 +1013,7 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
 
 
 # =============================================================================
-# ENTRY POINT 1 — Admin DM (purana system, waisa ka waisa)
+# ENTRY POINT 1 — Admin DM
 # =============================================================================
 async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
@@ -837,13 +1028,17 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async def notify(text, **kwargs):
-        return await msg.reply_text(text, **kwargs)
+        try:
+            return await msg.reply_text(text, **kwargs)
+        except Exception as e:
+            logger.error(f"Reply fail: {e}")
+            return None
 
     await process_and_post(context, msg, notify)
 
 
 # =============================================================================
-# ENTRY POINT 2 — Draft channel post (naya system)
+# ENTRY POINT 2 — Draft channel post
 # =============================================================================
 async def _offer_source_setup(context, chat):
     """Unknown channel se post aayi — admin ko ID + button bhejo (ek hi baar)."""
@@ -875,7 +1070,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     source = (config.get("source_channel") or "").strip()
     target = (config.get("channel") or "").strip()
 
-    # Kabhi bhi apne hi post channel ko na uthao — warna infinite loop
+    # Apne hi post channel ko kabhi na uthao — warna infinite loop
     if target and chat_matches(msg.chat, target):
         return
 
@@ -897,7 +1092,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    src_name  = msg.chat.title or source
+    src_name   = msg.chat.title or source
     source_tag = f"\n📥 Source: <b>{html_lib.escape(src_name)}</b>"
 
     async def notify(text, **kwargs):
@@ -916,7 +1111,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Unauthorized.")
         return
     await query.answer()
-    data = query.data
+    data = query.data or ""
 
     # ── Cancel ────────────────────────────────────────────────────────────
     if data == "cancel":
@@ -936,7 +1131,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if same_channel(chat_id, target):
             try:
                 await query.edit_message_text(
-                    "⚠️ Ye to tumhara post channel hi hai! Draft channel alag hona chahiye.",
+                    "⚠️ Ye to tumhara post channel hi hai! Draft channel alag hona chahiye."
                 )
             except Exception:
                 pass
@@ -1256,15 +1451,15 @@ def main():
 
     async def post_init(application):
         await application.bot.set_my_commands([
-            ("start",         "Bot shuru karo"),
-            ("help",          "Saari commands dekho"),
-            ("status",        "Channel aur watermark status"),
-            ("setchannel",    "Post channel set karo"),
-            ("setsource",     "Draft channel set karo (auto pickup)"),
-            ("watermark",     "Watermark ON/OFF aur text change karo"),
-            ("setbutton",     "Deal buttons configure karo"),
-            ("testamz",       "Amazon API test karo"),
-            ("exportconfig",  "Config ka backup lo"),
+            ("start",         "ℹ️ Bot ki info"),
+            ("help",          "📖 Saari commands"),
+            ("status",        "📊 Channel, watermark, buttons ka status"),
+            ("setchannel",    "📢 Post channel set karo"),
+            ("setsource",     "📥 Draft channel set karo (auto pickup)"),
+            ("watermark",     "🖼️ Watermark ON/OFF aur text"),
+            ("setbutton",     "🎛️ Post ke buttons configure karo"),
+            ("testamz",       "🧪 Amazon API test karo"),
+            ("exportconfig",  "💾 Config ka backup lo"),
         ])
         logger.info("Bot commands Telegram pe register ho gayi.")
 
@@ -1284,13 +1479,13 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Purana system — admin DM se message
+    # Admin DM se message
     app.add_handler(MessageHandler(
         filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_deal
     ))
 
-    # Naya system — draft channel se auto pickup
+    # Draft channel se auto pickup
     app.add_handler(MessageHandler(
         filters.UpdateType.CHANNEL_POST,
         handle_channel_post
