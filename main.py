@@ -43,6 +43,9 @@ FOOTER_LINE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Channels we've already offered to set as source (avoid DM spam)
+_offered_channels = set()
+
 
 # =============================================================================
 # HELPERS
@@ -94,6 +97,61 @@ async def _get_photo_bytes(bot, msg) -> bytes | None:
     except Exception as e:
         logger.error(f"Photo download fail: {e}")
     return None
+
+
+# =============================================================================
+# CHANNEL MATCHING / ADMIN NOTIFY HELPERS
+# =============================================================================
+def chat_matches(chat, ident: str) -> bool:
+    """Check if a Telegram chat matches a stored identifier (@name or -100...)."""
+    if not chat or not ident:
+        return False
+    ident = ident.strip()
+    if not ident:
+        return False
+    if ident.startswith("@"):
+        return (chat.username or "").lower() == ident[1:].lower()
+    try:
+        return chat.id == int(ident)
+    except (ValueError, TypeError):
+        return (chat.username or "").lower() == ident.lower()
+
+
+def same_channel(ident_a: str, ident_b: str) -> bool:
+    """Rough comparison of two stored channel identifiers."""
+    a = (ident_a or "").strip().lstrip("@").lower()
+    b = (ident_b or "").strip().lstrip("@").lower()
+    return bool(a) and a == b
+
+
+async def dm_admin(context, text, **kwargs):
+    """Send a status message to the admin's DM. Returns Message or None."""
+    if not ADMIN_ID:
+        return None
+    try:
+        return await context.bot.send_message(chat_id=ADMIN_ID, text=text, **kwargs)
+    except Exception as e:
+        logger.error(f"Admin DM fail: {e}")
+        return None
+
+
+async def _edit_or_notify(wait_msg, notify, text, **kwargs):
+    """Edit the 'please wait' message if possible, else send a fresh one."""
+    if wait_msg:
+        try:
+            await wait_msg.edit_text(text, **kwargs)
+            return
+        except Exception:
+            pass
+    await notify(text, **kwargs)
+
+
+async def _delete_quiet(m):
+    if m:
+        try:
+            await m.delete()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -272,23 +330,26 @@ def _btn_detail_text(btn_key: str, btn: dict) -> str:
 # COMMANDS
 # =============================================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
         "👋 <b>DealsKoti Bot chalu hai!</b>\n\n"
-        "Deal ka message bhejo — bot automatically channel mein post kar dega.\n\n"
+        "Do tarike se kaam karta hai:\n"
+        "1️⃣ Mujhe seedha deal ka message bhejo\n"
+        "2️⃣ Ya draft channel mein post karo — main khud uthaake bhej dunga\n\n"
         "/help daao sare commands dekhne ke liye.",
         parse_mode="HTML"
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
         "📖 <b>DealsKoti Bot — Sare Commands</b>\n\n"
         "📊 /status — Channel, watermark aur buttons ka status\n"
         "📢 /setchannel — Post karne wala channel set karo\n"
+        "📥 /setsource — Draft channel set karo (auto pickup)\n"
         "🖼️ /watermark — Watermark settings (on/off + text)\n"
         "🎛️ /setbutton — Post ke neeche buttons set karo\n"
         "🧪 /testamz — Amazon API test karo\n"
@@ -296,16 +357,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ /start — Bot ki info\n\n"
         "<b>Watermark shortcuts:</b>\n"
         "/watermark on — ON karo\n"
-        "/watermark off — OFF karo",
+        "/watermark off — OFF karo\n\n"
+        "<b>Draft channel shortcut:</b>\n"
+        "/setsource off — Auto pickup band karo",
         parse_mode="HTML"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     config  = load_config()
     channel = config.get("channel", "") or "❌ Set nahi hua (/setchannel)"
+    source  = config.get("source_channel", "") or "❌ Set nahi hua (/setsource)"
     wm      = config.get("watermark", {"enabled": True, "text": "@DealKoti"})
     buttons = config.get("buttons", {})
     b1      = buttons.get("btn1", {})
@@ -313,7 +377,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         "⚙️ <b>Bot Status</b>\n",
-        f"📢 <b>Channel :</b> <code>{html_lib.escape(channel)}</code>\n",
+        f"📥 <b>Draft Channel :</b> <code>{html_lib.escape(source)}</code>",
+        f"📢 <b>Post Channel  :</b> <code>{html_lib.escape(channel)}</code>\n",
         f"🖼️ <b>Watermark:</b> {'✅ ON' if wm.get('enabled') else '❌ OFF'} — "
         f"<code>{html_lib.escape(wm.get('text', '@DealKoti'))}</code>\n",
         "🎛️ <b>Buttons:</b>",
@@ -324,22 +389,55 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     context.user_data.clear()
     context.user_data["action"] = "wait_channel_id"
     config  = load_config()
     current = config.get("channel", "") or "Set nahi hua"
     await update.message.reply_text(
-        f"📢 <b>Channel Set Karo</b>\n\n"
+        f"📢 <b>Post Channel Set Karo</b>\n\n"
         f"Current: <code>{html_lib.escape(current)}</code>\n\n"
         f"Naya channel ID type karo (jaise @mychannel ya -100123456789):",
         parse_mode="HTML"
     )
 
 
+async def cmd_setsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the DRAFT channel — bot auto-picks every post from here."""
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+
+    args   = context.args or []
+    config = load_config()
+
+    if args and args[0].lower() in ("off", "band", "clear", "remove", "hatao"):
+        config["source_channel"] = ""
+        save_config(config)
+        await update.message.reply_text(
+            "❌ <b>Draft channel hata diya.</b>\n"
+            "Ab sirf DM wala system chalega — mujhe message bhejo.",
+            parse_mode="HTML"
+        )
+        return
+
+    context.user_data.clear()
+    context.user_data["action"] = "wait_source_id"
+    current = config.get("source_channel", "") or "Set nahi hua"
+    await update.message.reply_text(
+        f"📥 <b>Draft Channel Set Karo</b>\n\n"
+        f"Current: <code>{html_lib.escape(current)}</code>\n\n"
+        f"<b>Pehle ye karo:</b>\n"
+        f"1. Draft channel mein mujhe <b>admin</b> banao\n"
+        f"2. Phir yahan channel ID type karo (@mydraft ya -100123456789)\n\n"
+        f"<i>Tip: agar ID nahi pata to bas draft channel mein koi bhi post daal do — "
+        f"main khud yahan ID bhej dunga ek button ke saath.</i>",
+        parse_mode="HTML"
+    )
+
+
 async def cmd_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     args   = context.args or []
     config = load_config()
@@ -366,7 +464,6 @@ async def cmd_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Show settings menu
     await update.message.reply_text(
         _watermark_status_text(wm),
         parse_mode="HTML",
@@ -375,7 +472,7 @@ async def cmd_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     config  = load_config()
     buttons = config.get("buttons", {})
@@ -389,7 +486,7 @@ async def cmd_setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     await update.message.reply_text("🔄 Amazon Creators API test ho rahi hai...")
     try:
@@ -422,7 +519,7 @@ async def cmd_testamz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
     import json
     config      = load_config()
@@ -435,18 +532,13 @@ async def cmd_exportconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# MAIN DEAL HANDLER
+# CORE PROCESSOR — same logic for DM messages and draft-channel posts
 # =============================================================================
-async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-
-    if context.user_data.get("action"):
-        await handle_text_input(update, context)
-        return
-
-    msg = update.message
-
+async def process_and_post(context, msg, notify, config=None, source_tag: str = ""):
+    """
+    msg     — the incoming Telegram message (DM message OR channel post)
+    notify  — async callable(text, **kwargs) used for all admin status replies
+    """
     # ── Parse message content ──────────────────────────────────────────────
     if msg.caption is not None:
         raw_plain    = msg.caption or ""
@@ -466,11 +558,12 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_amazon  = len(amazon_urls) > 0
 
     if not raw_plain.strip() and not all_urls and not has_photo:
-        await msg.reply_text("⚠️ Message mein koi text ya link nahi mila.")
+        await notify("⚠️ Message mein koi text ya link nahi mila.")
         return
 
     # ── Load config ────────────────────────────────────────────────────────
-    config       = load_config()
+    if config is None:
+        config = load_config()
     channel      = config.get("channel", "").strip()
     final_markup = build_final_markup(config)
     wm_cfg       = config.get("watermark", {"enabled": True, "text": "@DealKoti"})
@@ -478,7 +571,7 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wm_text      = wm_cfg.get("text", "@DealKoti")
 
     if not channel:
-        await msg.reply_text(
+        await notify(
             "⚠️ <b>Channel set nahi hua!</b>\n/setchannel se pehle channel set karo.",
             parse_mode="HTML"
         )
@@ -505,13 +598,14 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=final_markup,
             )
-            await msg.reply_text(
+            await notify(
                 "✅ <b>Post ho gaya!</b>\n"
-                "⚠️ Multiple Amazon links thi — bina image ke text post kar di.",
+                "⚠️ Multiple Amazon links thi — bina image ke text post kar di."
+                + source_tag,
                 parse_mode="HTML"
             )
         except Exception as e:
-            await msg.reply_text(
+            await notify(
                 f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
                 parse_mode="HTML"
             )
@@ -523,21 +617,19 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_amazon and len(amazon_urls) == 1:
         amazon_url = amazon_urls[0]
 
-        # Resolve short links to get real URL
         resolved_url = amazon_url
         if needs_redirect(amazon_url):
             resolved_url = await _resolve_redirect(amazon_url)
 
-        # Block search pages
         if is_amazon_search_url(resolved_url):
-            await msg.reply_text(
+            await notify(
                 "🚫 <b>Skip!</b> Amazon search page tha — post nahi kiya.\n"
                 "Specific product ka link bhejo.",
                 parse_mode="HTML"
             )
             return
 
-        wait_msg = await msg.reply_text("⏳ Amazon product data fetch ho raha hai...")
+        wait_msg = await notify("⏳ Amazon product data fetch ho raha hai...")
 
         product    = await enrich_amazon_url(amazon_url)
         short_link = await get_short_affiliate_link(amazon_url)
@@ -547,7 +639,8 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = product["title"]
             dup, dup_time = is_duplicate(title)
             if dup:
-                await wait_msg.edit_text(
+                await _edit_or_notify(
+                    wait_msg, notify,
                     f"⚠️ <b>Duplicate!</b> Yeh deal {dup_time} already post ho chuki hai — skip kiya.\n"
                     f"🏷️ {html_lib.escape(title[:80])}",
                     parse_mode="HTML"
@@ -579,11 +672,10 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 logger.warning(f"Amazon API image download failed for: {image_url}")
 
-        # Apply watermark
         if img_bytes and wm_enabled:
             img_bytes = apply_watermark(img_bytes, wm_text)
 
-        await wait_msg.delete()
+        await _delete_quiet(wait_msg)
 
         # ── Post to channel ────────────────────────────────────────────────
         try:
@@ -607,7 +699,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if title:
                 mark_posted(title)
 
-            # ── Admin reply ────────────────────────────────────────────────
             lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
             if api_note:
                 lines.append(api_note)
@@ -617,12 +708,14 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 lines.append("🖼️ Image nahi mili — sirf text post kiya.")
             lines.append(f"📢 <code>{html_lib.escape(channel)}</code>")
-            await msg.reply_text(
+            if source_tag:
+                lines.append(source_tag.strip())
+            await notify(
                 "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
             )
 
         except Exception as e:
-            await msg.reply_text(
+            await notify(
                 f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
                 parse_mode="HTML"
             )
@@ -633,12 +726,11 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ==========================================================================
     cleaned_plain, cleaned_entities = remove_footer(raw_plain, raw_entities)
 
-    # Duplicate check
     dup_key = raw_plain.strip()[:300]
     if dup_key:
         dup, dup_time = is_duplicate(dup_key)
         if dup:
-            await msg.reply_text(
+            await notify(
                 f"⚠️ <b>Duplicate!</b> Yeh message {dup_time} already post ho chuka hai — skip kiya.",
                 parse_mode="HTML"
             )
@@ -648,7 +740,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if msg.photo:
-            # Download photo, apply watermark, post
             img_bytes = await _get_photo_bytes(context.bot, msg)
             if img_bytes and wm_enabled:
                 img_bytes = apply_watermark(img_bytes, wm_text)
@@ -668,7 +759,6 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=final_markup,
                 )
             else:
-                # Could not download photo — copy original
                 await context.bot.copy_message(
                     chat_id=channel,
                     from_chat_id=msg.chat_id,
@@ -679,15 +769,14 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             wm_tag = " + Watermark ✅" if (wm_enabled and img_bytes) else ""
-            await msg.reply_text(
+            await notify(
                 f"✅ <b>Post ho gaya!</b>\n"
                 f"🖼️ Photo ke saath{wm_tag}.\n"
-                f"📢 <code>{html_lib.escape(channel)}</code>",
+                f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML"
             )
 
         elif msg.document or msg.video or msg.animation or msg.video_note:
-            # Media that can't be easily watermarked — copy as-is
             final_caption = None
             if raw_plain.strip():
                 final_caption = _safe_truncate(
@@ -701,14 +790,13 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML" if final_caption else None,
                 reply_markup=final_markup,
             )
-            await msg.reply_text(
+            await notify(
                 f"✅ <b>Post ho gaya!</b>\n"
-                f"📢 <code>{html_lib.escape(channel)}</code>",
+                f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML"
             )
 
         else:
-            # Text only
             final_html = "🙏Jai Shree Ram Dosto🙏\n\n" + body_html
             await context.bot.send_message(
                 chat_id=channel,
@@ -717,9 +805,9 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=final_markup,
             )
-            await msg.reply_text(
+            await notify(
                 f"✅ <b>Post ho gaya!</b>\n"
-                f"📢 <code>{html_lib.escape(channel)}</code>",
+                f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML"
             )
 
@@ -727,10 +815,96 @@ async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark_posted(dup_key)
 
     except Exception as e:
-        await msg.reply_text(
+        await notify(
             f"❌ <b>Post fail!</b>\n<code>{html_lib.escape(str(e))}</code>",
             parse_mode="HTML"
         )
+
+
+# =============================================================================
+# ENTRY POINT 1 — Admin DM (purana system, waisa ka waisa)
+# =============================================================================
+async def handle_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+
+    if context.user_data and context.user_data.get("action"):
+        await handle_text_input(update, context)
+        return
+
+    msg = update.message
+    if not msg:
+        return
+
+    async def notify(text, **kwargs):
+        return await msg.reply_text(text, **kwargs)
+
+    await process_and_post(context, msg, notify)
+
+
+# =============================================================================
+# ENTRY POINT 2 — Draft channel post (naya system)
+# =============================================================================
+async def _offer_source_setup(context, chat):
+    """Unknown channel se post aayi — admin ko ID + button bhejo (ek hi baar)."""
+    if chat.id in _offered_channels:
+        return
+    _offered_channels.add(chat.id)
+    title = chat.title or "Channel"
+    await dm_admin(
+        context,
+        f"📥 <b>Naye channel se post aayi</b>\n\n"
+        f"Naam : <b>{html_lib.escape(title)}</b>\n"
+        f"ID   : <code>{chat.id}</code>\n\n"
+        f"Kya isse draft channel banana hai? "
+        f"Iske baad yahan ki har post automatically post channel pe chali jayegi.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Haan, draft bana do", callback_data=f"srcset_{chat.id}"),
+            InlineKeyboardButton("❌ Nahi",                callback_data="cancel"),
+        ]])
+    )
+
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post
+    if not msg:
+        return
+
+    config = load_config()
+    source = (config.get("source_channel") or "").strip()
+    target = (config.get("channel") or "").strip()
+
+    # Kabhi bhi apne hi post channel ko na uthao — warna infinite loop
+    if target and chat_matches(msg.chat, target):
+        return
+
+    if not source:
+        await _offer_source_setup(context, msg.chat)
+        return
+
+    if not chat_matches(msg.chat, source):
+        return
+
+    if same_channel(source, target):
+        logger.warning("Source aur target channel same hain — skip.")
+        await dm_admin(
+            context,
+            "⚠️ <b>Draft aur post channel same hai!</b>\n"
+            "Infinite loop se bachne ke liye post skip kar di. "
+            "/setsource se alag draft channel set karo.",
+            parse_mode="HTML"
+        )
+        return
+
+    src_name  = msg.chat.title or source
+    source_tag = f"\n📥 Source: <b>{html_lib.escape(src_name)}</b>"
+
+    async def notify(text, **kwargs):
+        return await dm_admin(context, text, **kwargs)
+
+    logger.info(f"Draft channel post pakda: {msg.chat.id} / msg {msg.message_id}")
+    await process_and_post(context, msg, notify, config=config, source_tag=source_tag)
 
 
 # =============================================================================
@@ -746,9 +920,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Cancel ────────────────────────────────────────────────────────────
     if data == "cancel":
-        context.user_data.clear()
+        if context.user_data is not None:
+            context.user_data.clear()
         try:
             await query.edit_message_text("❌ Cancel ho gaya.")
+        except Exception:
+            pass
+        return
+
+    # ── Draft channel quick-set ───────────────────────────────────────────
+    if data.startswith("srcset_"):
+        chat_id = data.split("_", 1)[1]
+        cfg     = load_config()
+        target  = (cfg.get("channel") or "").strip()
+        if same_channel(chat_id, target):
+            try:
+                await query.edit_message_text(
+                    "⚠️ Ye to tumhara post channel hi hai! Draft channel alag hona chahiye.",
+                )
+            except Exception:
+                pass
+            return
+        cfg["source_channel"] = chat_id
+        save_config(cfg)
+        try:
+            await query.edit_message_text(
+                f"✅ <b>Draft channel set ho gaya!</b>\n"
+                f"📥 <code>{html_lib.escape(chat_id)}</code>\n\n"
+                f"Ab yahan jo bhi post karoge, wo automatically transform hoke "
+                f"post channel pe chali jayegi.",
+                parse_mode="HTML"
+            )
         except Exception:
             pass
         return
@@ -922,7 +1124,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # TEXT INPUT HANDLER
 # =============================================================================
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
 
     action = context.user_data.get("action")
@@ -937,11 +1139,42 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Channel ID khali nahi ho sakta.")
             return
         cfg = load_config()
+        if same_channel(text, cfg.get("source_channel", "")):
+            await update.message.reply_text(
+                "⚠️ Ye to draft channel hai! Post channel alag hona chahiye, "
+                "warna infinite loop ban jayega."
+            )
+            return
         cfg["channel"] = text
         save_config(cfg)
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ <b>Channel set ho gaya!</b>\n📢 <code>{html_lib.escape(text)}</code>",
+            f"✅ <b>Post channel set ho gaya!</b>\n📢 <code>{html_lib.escape(text)}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # /setsource flow
+    if action == "wait_source_id":
+        if not text:
+            await update.message.reply_text("⚠️ Channel ID khali nahi ho sakta.")
+            return
+        cfg = load_config()
+        if same_channel(text, cfg.get("channel", "")):
+            await update.message.reply_text(
+                "⚠️ Ye to tumhara post channel hai! Draft channel alag hona chahiye, "
+                "warna bot apni hi post baar baar uthata rahega."
+            )
+            return
+        cfg["source_channel"] = text
+        save_config(cfg)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ <b>Draft channel set ho gaya!</b>\n"
+            f"📥 <code>{html_lib.escape(text)}</code>\n\n"
+            f"Ab yahan post karo — main khud uthaake transform karke "
+            f"post channel pe bhej dunga.\n\n"
+            f"<i>Dhyan rakhna: bot ko is channel mein admin banana zaroori hai.</i>",
             parse_mode="HTML"
         )
         return
@@ -1021,13 +1254,13 @@ def main():
         logger.error(f"DB init failed: {e}")
         raise
 
-    # Register command list so they appear in Telegram's "/" menu
     async def post_init(application):
         await application.bot.set_my_commands([
             ("start",         "Bot shuru karo"),
             ("help",          "Saari commands dekho"),
             ("status",        "Channel aur watermark status"),
-            ("setchannel",    "Deal channel set karo"),
+            ("setchannel",    "Post channel set karo"),
+            ("setsource",     "Draft channel set karo (auto pickup)"),
             ("watermark",     "Watermark ON/OFF aur text change karo"),
             ("setbutton",     "Deal buttons configure karo"),
             ("testamz",       "Amazon API test karo"),
@@ -1037,24 +1270,37 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
-    app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("help",         cmd_help))
-    app.add_handler(CommandHandler("status",       cmd_status))
-    app.add_handler(CommandHandler("setchannel",   cmd_setchannel))
-    app.add_handler(CommandHandler("watermark",    cmd_watermark))
-    app.add_handler(CommandHandler("setbutton",    cmd_setbutton))
-    app.add_handler(CommandHandler("testamz",      cmd_testamz))
-    app.add_handler(CommandHandler("exportconfig", cmd_exportconfig))
+    dm_only = filters.ChatType.PRIVATE
+
+    app.add_handler(CommandHandler("start",        cmd_start,        filters=dm_only))
+    app.add_handler(CommandHandler("help",         cmd_help,         filters=dm_only))
+    app.add_handler(CommandHandler("status",       cmd_status,       filters=dm_only))
+    app.add_handler(CommandHandler("setchannel",   cmd_setchannel,   filters=dm_only))
+    app.add_handler(CommandHandler("setsource",    cmd_setsource,    filters=dm_only))
+    app.add_handler(CommandHandler("watermark",    cmd_watermark,    filters=dm_only))
+    app.add_handler(CommandHandler("setbutton",    cmd_setbutton,    filters=dm_only))
+    app.add_handler(CommandHandler("testamz",      cmd_testamz,      filters=dm_only))
+    app.add_handler(CommandHandler("exportconfig", cmd_exportconfig, filters=dm_only))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
 
+    # Purana system — admin DM se message
     app.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND,
+        filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_deal
     ))
 
+    # Naya system — draft channel se auto pickup
+    app.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POST,
+        handle_channel_post
+    ))
+
     logger.info("DealsKoti Bot start ho raha hai...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "channel_post", "callback_query"],
+    )
 
 
 if __name__ == "__main__":
