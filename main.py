@@ -359,6 +359,35 @@ def entities_to_html(text: str, entities: list) -> str:
 
 
 # =============================================================================
+# SILENT UI HELPERS
+# =============================================================================
+def _silent_status_text(silent: bool) -> str:
+    if silent:
+        body = (
+            "Status: <b>🔕 SILENT</b>\n\n"
+            "Post channel mein normal aati hai, par subscribers ke phone pe "
+            "sound aur popup nahi hota. Unread badge phir bhi dikhta hai.\n\n"
+            "<i>Zyada deals post karte waqt yahi behtar hai — log mute nahi karte.</i>"
+        )
+    else:
+        body = (
+            "Status: <b>🔔 LOUD</b>\n\n"
+            "Har post pe subscribers ko poori notification jaati hai "
+            "(sound + popup).\n\n"
+            "<i>Din mein bahut deals ja rahi hain to log mute kar sakte hain.</i>"
+        )
+    return "🔔 <b>Notification Settings</b>\n\n" + body
+
+
+def _silent_kb(silent: bool) -> InlineKeyboardMarkup:
+    toggle = "🔔 Loud karo" if silent else "🔕 Silent karo"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle,   callback_data="silent_toggle")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+    ])
+
+
+# =============================================================================
 # WATERMARK UI HELPERS
 # =============================================================================
 def _watermark_status_text(wm: dict) -> str:
@@ -455,14 +484,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 <b>DealsKoti Bot — Saare Commands</b>\n\n"
         "ℹ️ /start — Bot ki info\n"
         "📖 /help — Ye list\n"
-        "📊 /status — Channel, watermark aur buttons ka status\n"
+        "📊 /status — Poora status ek jagah\n"
         "📢 /setchannel — Post karne wala channel set karo\n"
         "📥 /setsource — Draft channel set karo (auto pickup)\n"
+        "🔔 /silent — Notification silent ya loud\n"
         "🖼️ /watermark — Watermark settings (ON/OFF + text)\n"
         "🎛️ /setbutton — Post ke neeche buttons set karo\n"
         "🧪 /testamz — Amazon Creators API test karo\n"
         "💾 /exportconfig — Config ka JSON backup\n\n"
         "<b>⚡ Shortcuts</b>\n"
+        "<code>/silent on</code> — Chup-chaap post karo\n"
+        "<code>/silent off</code> — Poori notification bhejo\n"
         "<code>/watermark on</code> — Watermark ON\n"
         "<code>/watermark off</code> — Watermark OFF\n"
         "<code>/setsource off</code> — Auto pickup band\n\n"
@@ -484,6 +516,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config  = load_config()
     channel = config.get("channel", "") or "❌ Set nahi hua (/setchannel)"
     source  = config.get("source_channel", "") or "❌ Set nahi hua (/setsource)"
+    silent  = config.get("silent", True)
     wm      = config.get("watermark", {"enabled": True, "text": "@DealKoti"})
     buttons = config.get("buttons", {})
     b1      = buttons.get("btn1", {})
@@ -493,6 +526,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ <b>Bot Status</b>\n",
         f"📥 <b>Draft Channel :</b> <code>{html_lib.escape(source)}</code>",
         f"📢 <b>Post Channel  :</b> <code>{html_lib.escape(channel)}</code>\n",
+        f"🔔 <b>Notification:</b> {'🔕 Silent' if silent else '🔔 Loud'}",
         f"🖼️ <b>Watermark:</b> {'✅ ON' if wm.get('enabled') else '❌ OFF'} — "
         f"<code>{html_lib.escape(wm.get('text', '@DealKoti'))}</code>\n",
         "🎛️ <b>Buttons:</b>",
@@ -500,6 +534,43 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Button 2: {'✅ ON' if b2.get('enabled') else '❌ OFF'} — <b>{html_lib.escape(b2.get('label', '-'))}</b>",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_silent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Silent (no sound/popup) ya loud notification."""
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+
+    args   = context.args or []
+    config = load_config()
+
+    if args:
+        arg = args[0].lower()
+        if arg in ("on", "chalu", "haan"):
+            config["silent"] = True
+            save_config(config)
+            await update.message.reply_text(
+                "🔕 <b>Silent posting ON.</b>\n"
+                "Ab posts subscribers ke phone pe bina sound ke jaayengi.",
+                parse_mode="HTML"
+            )
+            return
+        elif arg in ("off", "band", "nahi"):
+            config["silent"] = False
+            save_config(config)
+            await update.message.reply_text(
+                "🔔 <b>Silent posting OFF.</b>\n"
+                "Ab har post pe poori notification jaayegi.",
+                parse_mode="HTML"
+            )
+            return
+
+    silent = config.get("silent", True)
+    await update.message.reply_text(
+        _silent_status_text(silent),
+        parse_mode="HTML",
+        reply_markup=_silent_kb(silent)
+    )
 
 
 async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -685,7 +756,8 @@ async def classify_amazon_urls(urls: list) -> dict:
 # =============================================================================
 # SINGLE PRODUCT POSTER — ek ASIN ki ek post
 # =============================================================================
-async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_text):
+async def post_amazon_product(context, item, channel, markup,
+                              wm_enabled, wm_text, silent):
     """
     Ek Amazon product ko channel pe post karo.
     Returns (status, detail, img_source):
@@ -738,6 +810,7 @@ async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_tex
                 caption=caption_html,
                 parse_mode="HTML",
                 reply_markup=markup,
+                disable_notification=silent,
             )
         else:
             await context.bot.send_message(
@@ -746,6 +819,7 @@ async def post_amazon_product(context, item, channel, markup, wm_enabled, wm_tex
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=markup,
+                disable_notification=silent,
             )
         mark_posted(title)
         return "posted", title, img_source
@@ -789,9 +863,12 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
         config = load_config()
     channel      = config.get("channel", "").strip()
     final_markup = build_final_markup(config)
+    silent       = config.get("silent", True)
     wm_cfg       = config.get("watermark", {"enabled": True, "text": "@DealKoti"})
     wm_enabled   = wm_cfg.get("enabled", True)
     wm_text      = wm_cfg.get("text", "@DealKoti")
+
+    bell = "🔕 Silent" if silent else "🔔 Loud"
 
     if not channel:
         await notify(
@@ -852,7 +929,8 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
 
             for i, item in enumerate(products):
                 status, detail, img_source = await post_amazon_product(
-                    context, item, channel, final_markup, wm_enabled, wm_text
+                    context, item, channel, final_markup,
+                    wm_enabled, wm_text, silent
                 )
                 if status == "posted":
                     posted.append(detail)
@@ -885,11 +963,13 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                         reply_markup=final_markup,
+                        disable_notification=silent,
                     )
                     await notify(
                         "✅ <b>Post ho gaya!</b>\n"
                         "⚠️ Amazon API se product data nahi mila — "
                         "original text affiliate link ke saath post kar diya.\n"
+                        f"🔔 {bell}\n"
                         f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                         parse_mode="HTML", disable_web_page_preview=True
                     )
@@ -900,13 +980,14 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                     )
                 return
 
-            # ── Single product success → purana wala short reply ───────────
+            # ── Single product success → chhota reply ──────────────────────
             if total == 1 and len(posted) == 1:
                 lines = ["✅ <b>Amazon Deal Post Ho Gaya!</b>"]
                 if img_note:
                     lines.append(f"🖼️ Image: {img_note}")
                 else:
                     lines.append("🖼️ Image nahi mili — sirf text post kiya.")
+                lines.append(f"🔔 {bell}")
                 lines.append(f"📢 <code>{html_lib.escape(channel)}</code>")
                 if source_tag:
                     lines.append(source_tag.strip())
@@ -939,7 +1020,9 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                 lines.append(f"\n🚫 {len(searches)} search/deals page ignore kiye.")
             if unknown:
                 lines.append(f"\n❓ {len(unknown)} Amazon link se product pehchan nahi paya.")
-            lines.append(f"\n📢 <code>{html_lib.escape(channel)}</code>")
+            if posted:
+                lines.append(f"\n🔔 {bell}")
+            lines.append(f"📢 <code>{html_lib.escape(channel)}</code>")
             if source_tag:
                 lines.append(source_tag.strip())
 
@@ -963,6 +1046,7 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=final_markup,
+                disable_notification=silent,
             )
             note = f"\n🚫 {len(searches)} search page ignore kiye." if searches else ""
             await notify(
@@ -970,6 +1054,7 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                 "⚠️ Amazon product link pehchan nahi paya — "
                 "text post kar diya affiliate link ke saath."
                 + note
+                + f"\n🔔 {bell}"
                 + f"\n📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML", disable_web_page_preview=True
             )
@@ -1016,6 +1101,7 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                     caption=final_caption,
                     parse_mode="HTML" if final_caption else None,
                     reply_markup=final_markup,
+                    disable_notification=silent,
                 )
             else:
                 await context.bot.copy_message(
@@ -1025,12 +1111,14 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                     caption=final_caption,
                     parse_mode="HTML" if final_caption else None,
                     reply_markup=final_markup,
+                    disable_notification=silent,
                 )
 
             wm_tag = " + Watermark ✅" if (wm_enabled and img_bytes) else ""
             await notify(
                 f"✅ <b>Post ho gaya!</b>\n"
                 f"🖼️ Photo ke saath{wm_tag}.\n"
+                f"🔔 {bell}\n"
                 f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML"
             )
@@ -1048,9 +1136,11 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                 caption=final_caption,
                 parse_mode="HTML" if final_caption else None,
                 reply_markup=final_markup,
+                disable_notification=silent,
             )
             await notify(
                 f"✅ <b>Post ho gaya!</b>\n"
+                f"🔔 {bell}\n"
                 f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML"
             )
@@ -1063,9 +1153,11 @@ async def process_and_post(context, msg, notify, config=None, source_tag: str = 
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=final_markup,
+                disable_notification=silent,
             )
             await notify(
                 f"✅ <b>Post ho gaya!</b>\n"
+                f"🔔 {bell}\n"
                 f"📢 <code>{html_lib.escape(channel)}</code>" + source_tag,
                 parse_mode="HTML"
             )
@@ -1168,9 +1260,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     source_tag = f"\n📥 Source: <b>{html_lib.escape(src_name)}</b>"
 
     async def notify(text, **kwargs):
-        """Status reply DRAFT CHANNEL mein hi, usi post ke reply ke roop mein."""
+        """Status reply DRAFT CHANNEL mein, hamesha silent (ye sirf receipt hai)."""
         try:
-            sent = await msg.reply_text(text + SELF_MARKER, **kwargs)
+            sent = await msg.reply_text(
+                text + SELF_MARKER, disable_notification=True, **kwargs
+            )
             return _remember_own(sent)
         except Exception as e:
             # Channel mein post permission nahi? To DM pe bhej do.
@@ -1198,6 +1292,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
         try:
             await query.edit_message_text("❌ Cancel ho gaya.")
+        except Exception:
+            pass
+        return
+
+    # ── Silent toggle ─────────────────────────────────────────────────────
+    if data == "silent_toggle":
+        cfg = load_config()
+        cfg["silent"] = not cfg.get("silent", True)
+        save_config(cfg)
+        try:
+            await query.edit_message_text(
+                _silent_status_text(cfg["silent"]),
+                parse_mode="HTML",
+                reply_markup=_silent_kb(cfg["silent"])
+            )
         except Exception:
             pass
         return
@@ -1532,9 +1641,10 @@ def main():
         await application.bot.set_my_commands([
             ("start",         "ℹ️ Bot ki info"),
             ("help",          "📖 Saari commands"),
-            ("status",        "📊 Channel, watermark, buttons ka status"),
+            ("status",        "📊 Poora status ek jagah"),
             ("setchannel",    "📢 Post channel set karo"),
             ("setsource",     "📥 Draft channel set karo (auto pickup)"),
+            ("silent",        "🔔 Notification silent ya loud"),
             ("watermark",     "🖼️ Watermark ON/OFF aur text"),
             ("setbutton",     "🎛️ Post ke buttons configure karo"),
             ("testamz",       "🧪 Amazon API test karo"),
@@ -1551,6 +1661,7 @@ def main():
     app.add_handler(CommandHandler("status",       cmd_status,       filters=dm_only))
     app.add_handler(CommandHandler("setchannel",   cmd_setchannel,   filters=dm_only))
     app.add_handler(CommandHandler("setsource",    cmd_setsource,    filters=dm_only))
+    app.add_handler(CommandHandler("silent",       cmd_silent,       filters=dm_only))
     app.add_handler(CommandHandler("watermark",    cmd_watermark,    filters=dm_only))
     app.add_handler(CommandHandler("setbutton",    cmd_setbutton,    filters=dm_only))
     app.add_handler(CommandHandler("testamz",      cmd_testamz,      filters=dm_only))
