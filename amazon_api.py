@@ -465,7 +465,9 @@ async def _call_get_items(asins: list) -> dict:
             continue
         parsed = _parse_item(item)
         parsed["asin"] = asin
-        parsed["affiliate_link"] = parsed.get("detail_url") or make_affiliate_url(asin)
+        # Saaf link — ?tag=... bas. Amazon ka detailPageURL mein
+        # linkCode/th/psc jaisa kachra hota hai, wo nahi chahiye.
+        parsed["affiliate_link"] = make_affiliate_url(asin)
         parsed["cart_link"]      = make_cart_url(asin)
         out[asin] = parsed
 
