@@ -161,14 +161,19 @@ def build_amazon_caption(product: dict, short_link: str, cfg: dict,
     detailed = cfg.get("amz_detailed", True)
     hdr      = cfg.get("header", {})
     ftr      = cfg.get("footer", {})
+    btns     = cfg.get("buttons", {})
 
     limit = (PHOTO_CAPTION_LIMIT if has_image else TEXT_LIMIT) - 8
 
     head_line = (hdr.get("text") or "").strip() if hdr.get("enabled") else ""
     foot_line = (ftr.get("text") or "").strip() if ftr.get("enabled") else ""
 
+    # Buy Now button ON hai to link usme hai — caption mein dobara nahi chahiye.
+    buy_on    = bool(btns.get("buy", {}).get("enabled"))
+    show_link = fields.get("link", True) and not buy_on
+
     link_line = ""
-    if fields.get("link", True) and short_link:
+    if show_link and short_link:
         link_line = f'🔗 <b><a href="{_esc(short_link)}">{_esc(short_link)}</a></b>'
 
     # Header / footer / link ki jagah pehle se reserve
@@ -224,7 +229,7 @@ def build_amazon_caption(product: dict, short_link: str, cfg: dict,
 
     caption = "\n".join(parts).strip()
     if not caption:
-        caption = link_line or "🔥 Deal"
+        caption = link_line or (_render_field("price", product) or "🔥 Deal")
 
     return caption, skipped
 
