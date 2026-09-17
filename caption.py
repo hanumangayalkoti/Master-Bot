@@ -1,79 +1,258 @@
+"""
+caption.py — Amazon deal caption builder. Har field config se on/off hota hai,
+aur caption Telegram ki limit ke andar rehta hai.
+"""
 import re
+import html as html_lib
 
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# Telegram limits
+PHOTO_CAPTION_LIMIT = 1024
+TEXT_LIMIT          = 4096
+
+# Caption mein fields kis order se bharenge
+FIELD_ORDER = [
+    "title", "deal", "mrp", "price", "savings", "discount",
+    "rating", "reviews", "stock", "brand", "seller", "rank", "features",
+]
+
+FIELD_LABELS = {
+    "title":    "Title",
+    "deal":     "Deal badge",
+    "mrp":      "MRP",
+    "price":    "Buy At",
+    "savings":  "You Save",
+    "discount": "Discount",
+    "rating":   "Rating",
+    "reviews":  "Reviews",
+    "stock":    "Stock",
+    "brand":    "Brand",
+    "seller":   "Seller",
+    "rank":     "Best Seller Rank",
+    "features": "Features",
+    "image":    "Image",
+    "link":     "Link",
+}
 
 
 def _visible_len(html_text: str) -> int:
     return len(_TAG_RE.sub("", html_text))
 
 
-def _safe_truncate(html_text: str, max_visible: int = 1020) -> str:
+def _safe_truncate(html_text: str, max_visible: int = PHOTO_CAPTION_LIMIT - 4) -> str:
+    """Purane behaviour ke liye rakha gaya — non-Amazon posts isse use karte hain."""
     if _visible_len(html_text) <= max_visible:
         return html_text
     lines = html_text.rsplit("\n", 1)
     if len(lines) == 2:
         body, last_line = lines
         last_visible = _visible_len(last_line) + 1
-        body_limit = max_visible - last_visible - 3
-        body_plain = _TAG_RE.sub("", body)
+        body_limit   = max_visible - last_visible - 3
+        body_plain   = _TAG_RE.sub("", body)
         if body_limit > 20:
             return body_plain[:body_limit] + "...\n" + last_line
     plain = _TAG_RE.sub("", html_text)
     return plain[:max_visible - 3] + "..."
 
 
-def _short_title(title: str) -> str:
-    """Clean product title — max 8 words."""
+def _short_title(title: str, words: int = 10) -> str:
     if not title:
         return "Hot Deal"
-    words = title.split()
-    if len(words) <= 8:
+    parts = title.split()
+    if len(parts) <= words:
         return title
-    return " ".join(words[:8]) + "..."
+    return " ".join(parts[:words]) + "..."
 
 
-def build_amazon_caption(product: dict, short_link: str) -> str:
-    title        = product.get("title", "").strip()
-    actual_price = product.get("actual_price", "").strip()
-    deal_price   = product.get("deal_price", "").strip()
-    discount_pct = product.get("discount_pct", 0)
-    savings      = product.get("savings", "").strip()
-    rating       = product.get("rating", "").strip()
-    review_count = product.get("review_count", "").strip()
+def _esc(v) -> str:
+    return html_lib.escape(str(v or ""))
 
-    display_title = _short_title(title) or "Hot Deal"
 
-    lines = []
-    lines.append("🙏Jai Shree Ram Dosto🙏")
-    lines.append("")
-    lines.append(f"🔥 <b>{display_title}</b>")
-    lines.append("")
+# =============================================================================
+# FIELD RENDERERS — har ek ek line (ya None) deta hai
+# =============================================================================
+def _render_field(name: str, p: dict) -> str | None:
+    if name == "title":
+        t = (p.get("title") or "").strip()
+        return f"🔥 <b>{_esc(_short_title(t))}</b>" if t else None
 
-    if actual_price and deal_price and actual_price != deal_price:
-        lines.append(f"💰 MRP:          <s>{actual_price}</s>")
-        lines.append(f"🏷️ Buy At:        <b>{deal_price}</b>")
-        if savings:
-            lines.append(f"💵 You Save:     <b>{savings}</b>")
-    elif deal_price:
-        lines.append(f"🏷️ Buy At: <b>{deal_price}</b>")
-    elif actual_price:
-        lines.append(f"💰 Price: <b>{actual_price}</b>")
+    if name == "deal":
+        badge = (p.get("deal_badge") or "").strip()
+        ends  = (p.get("deal_ends") or "").strip()
+        if not badge:
+            return None
+        if ends:
+            return f"⚡ <b>{_esc(badge)}</b> — {_esc(ends)}"
+        return f"⚡ <b>{_esc(badge)}</b>"
 
-    try:
-        disc = int(discount_pct)
-    except (ValueError, TypeError):
-        disc = 0
-    if disc > 0:
-        lines.append(f"📉 Discount:      <b>{disc}% OFF</b>")
+    if name == "mrp":
+        mrp   = (p.get("actual_price") or "").strip()
+        price = (p.get("deal_price") or "").strip()
+        if mrp and price and mrp != price:
+            return f"💰 MRP:          <s>{_esc(mrp)}</s>"
+        return None
 
-    if rating:
-        lines.append(f"⭐ Rating:        <b>{rating}/5</b>")
-    if review_count:
-        lines.append(f"👥 Reviews:       <b>{review_count}</b>")
+    if name == "price":
+        price = (p.get("deal_price") or "").strip()
+        return f"🏷️ Buy At:        <b>{_esc(price)}</b>" if price else None
 
-    lines.append("")
-    if short_link:
-        lines.append(f'🔗 <b><a href="{short_link}">{short_link}</a></b>')
+    if name == "savings":
+        s = (p.get("savings") or "").strip()
+        return f"💵 You Save:     <b>{_esc(s)}</b>" if s else None
 
-    caption = "\n".join(lines)
-    return _safe_truncate(caption, max_visible=1020)
+    if name == "discount":
+        try:
+            d = int(p.get("discount_pct") or 0)
+        except (ValueError, TypeError):
+            d = 0
+        return f"📉 Discount:      <b>{d}% OFF</b>" if d > 0 else None
+
+    if name == "rating":
+        r = (p.get("rating") or "").strip()
+        return f"⭐ Rating:        <b>{_esc(r)}/5</b>" if r else None
+
+    if name == "reviews":
+        rc = (p.get("review_count") or "").strip()
+        return f"👥 Reviews:       <b>{_esc(rc)}</b>" if rc else None
+
+    if name == "stock":
+        st = (p.get("stock_note") or "").strip()
+        return f"📦 Stock:         <b>{_esc(st)}</b>" if st else None
+
+    if name == "brand":
+        b = (p.get("brand") or "").strip()
+        return f"🏷️ Brand:         <b>{_esc(b)}</b>" if b else None
+
+    if name == "seller":
+        m = (p.get("seller") or "").strip()
+        return f"🏪 Seller:        <b>{_esc(m)}</b>" if m else None
+
+    if name == "rank":
+        rk = (p.get("sales_rank") or "").strip()
+        return f"🏆 <b>{_esc(rk)}</b>" if rk else None
+
+    if name == "features":
+        feats = p.get("features") or []
+        picked = []
+        for f in feats[:2]:
+            f = (f or "").strip()
+            if not f:
+                continue
+            if len(f) > 110:
+                f = f[:107].rstrip() + "..."
+            picked.append(f"• {_esc(f)}")
+        return "\n".join(picked) if picked else None
+
+    return None
+
+
+# =============================================================================
+# MAIN BUILDER
+# =============================================================================
+def build_amazon_caption(product: dict, short_link: str, cfg: dict,
+                         has_image: bool = True):
+    """
+    Returns (caption_html, skipped_fields)
+    skipped_fields — wo on fields jo jagah kam hone se chhoot gaye.
+    """
+    cfg      = cfg or {}
+    fields   = cfg.get("amz_fields", {})
+    detailed = cfg.get("amz_detailed", True)
+    hdr      = cfg.get("header", {})
+    ftr      = cfg.get("footer", {})
+
+    limit = (PHOTO_CAPTION_LIMIT if has_image else TEXT_LIMIT) - 8
+
+    head_line = (hdr.get("text") or "").strip() if hdr.get("enabled") else ""
+    foot_line = (ftr.get("text") or "").strip() if ftr.get("enabled") else ""
+
+    link_line = ""
+    if fields.get("link", True) and short_link:
+        link_line = f'🔗 <b><a href="{_esc(short_link)}">{_esc(short_link)}</a></b>'
+
+    # Header / footer / link ki jagah pehle se reserve
+    reserved = 0
+    if head_line:
+        reserved += len(head_line) + 2
+    if foot_line:
+        reserved += len(foot_line) + 2
+    if link_line:
+        reserved += _visible_len(link_line) + 2
+
+    budget  = limit - reserved
+    skipped = []
+    body    = []
+
+    if not detailed:
+        # MINIMAL MODE — sirf price (aur link, jo alag se lagta hai)
+        price_line = _render_field("price", product)
+        if not price_line:
+            mrp = (product.get("actual_price") or "").strip()
+            if mrp:
+                price_line = f"💰 Price: <b>{_esc(mrp)}</b>"
+        if price_line and _visible_len(price_line) <= budget:
+            body.append(price_line)
+    else:
+        for name in FIELD_ORDER:
+            if not fields.get(name, False):
+                continue
+            line = _render_field(name, product)
+            if not line:
+                continue
+            cost = _visible_len(line) + 1
+            if cost > budget:
+                skipped.append(name)
+                continue
+            body.append(line)
+            budget -= cost
+
+    # ── Assemble ──────────────────────────────────────────────────────────
+    parts = []
+    if head_line:
+        parts.append(_esc(head_line))
+        parts.append("")
+    if body:
+        parts.append("\n".join(body))
+        parts.append("")
+    if link_line:
+        parts.append(link_line)
+    if foot_line:
+        if link_line:
+            parts.append("")
+        parts.append(_esc(foot_line))
+
+    caption = "\n".join(parts).strip()
+    if not caption:
+        caption = link_line or "🔥 Deal"
+
+    return caption, skipped
+
+
+def wrap_plain_post(body_html: str, cfg: dict, has_image: bool = False) -> str:
+    """Non-Amazon post — header/footer lagao aur limit ke andar rakho."""
+    cfg = cfg or {}
+    hdr = cfg.get("header", {})
+    ftr = cfg.get("footer", {})
+
+    head_line = (hdr.get("text") or "").strip() if hdr.get("enabled") else ""
+    foot_line = (ftr.get("text") or "").strip() if ftr.get("enabled") else ""
+
+    limit    = (PHOTO_CAPTION_LIMIT if has_image else TEXT_LIMIT) - 8
+    reserved = 0
+    if head_line:
+        reserved += len(head_line) + 2
+    if foot_line:
+        reserved += len(foot_line) + 2
+
+    body = _safe_truncate(body_html, max(40, limit - reserved))
+
+    parts = []
+    if head_line:
+        parts.append(_esc(head_line))
+        parts.append("")
+    parts.append(body)
+    if foot_line:
+        parts.append("")
+        parts.append(_esc(foot_line))
+    return "\n".join(parts).strip()
