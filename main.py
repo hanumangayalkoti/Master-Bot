@@ -59,6 +59,27 @@ MAX_POST_TRIES      = 3       # queue item itni baar fail hua to drop
 
 SELF_MARKER = "\u2063"        # invisible — bot apne message pehchanne ke liye
 
+# ── TIMEZONE ─────────────────────────────────────────────────────────────
+# Railway container UTC pe chalta hai. Hourly batch aur jo time hum admin ko
+# dikhate hain, dono local time (default IST) mein hone chahiye.
+TZ_NAME = os.getenv("TZ_NAME", "Asia/Kolkata")
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo(TZ_NAME)
+    logger.info(f"Timezone: {TZ_NAME}")
+except Exception as e:
+    # tzdata missing ho to IST pe fallback
+    LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
+    logger.warning(f"ZoneInfo '{TZ_NAME}' nahi mila ({e}) — IST (+5:30) use kar raha hoon")
+
+
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def hhmm(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
 URL_REGEX = re.compile(r"(https?://[^\s\]\[<>\"']+)")
 
 FOOTER_LINE_PATTERN = re.compile(
@@ -192,10 +213,17 @@ async def _delete_quiet(m):
 
 
 def _next_hour_delay() -> float:
-    """Agle ghante ke top (1:00, 2:00...) tak kitne second."""
-    now = datetime.now()
+    """Agle LOCAL ghante ke top (1:00, 2:00...) tak kitne second."""
+    now = now_local()
     nxt = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
     return max(10.0, (nxt - now).total_seconds())
+
+
+def _next_batch_label() -> str:
+    """Agli batch ka local time, dikhane ke liye."""
+    nxt = (now_local() + timedelta(hours=1)).replace(minute=0, second=0,
+                                                     microsecond=0)
+    return hhmm(nxt)
 
 
 # =============================================================================
@@ -364,17 +392,29 @@ def entities_to_html(text: str, entities: list) -> str:
 # UI BUILDERS
 # =============================================================================
 def build_final_markup(config: dict, asin: str = ""):
-    """Inline buttons. Cart button sirf Amazon post (asin) ke saath aata hai."""
+    """
+    Inline buttons. Buy Now aur Add to Cart sirf Amazon post (asin) ke saath.
+    Dono on hain to ek hi row mein side by side, warna poori chaudai.
+    """
     btns = config.get("buttons", {})
     rows = []
 
-    cart = btns.get("cart", {})
-    if asin and cart.get("enabled"):
-        url = make_cart_url(asin)
-        if url:
-            rows.append([InlineKeyboardButton(
-                cart.get("label") or "🛒 Add to Cart", url=url
-            )])
+    amz_row = []
+    if asin:
+        buy = btns.get("buy", {})
+        if buy.get("enabled"):
+            url = make_affiliate_url(asin)
+            if url:
+                amz_row.append(InlineKeyboardButton(
+                    buy.get("label") or "⚡ Buy Now", url=url))
+        cart = btns.get("cart", {})
+        if cart.get("enabled"):
+            url = make_cart_url(asin)
+            if url:
+                amz_row.append(InlineKeyboardButton(
+                    cart.get("label") or "🛒 Add to Cart", url=url))
+    if amz_row:
+        rows.append(amz_row)
 
     row = []
     for key in ("btn1", "btn2"):
@@ -487,11 +527,10 @@ def _amz_kb(cfg: dict) -> InlineKeyboardMarkup:
 # ── /park_post ────────────────────────────────────────────────────────────
 def _park_status_text(cfg: dict, amz_n: int, oth_n: int) -> str:
     if cfg.get("park_post"):
-        nxt = (datetime.now() + timedelta(hours=1)).replace(minute=0)
         body = (
             f"Status: <b>🅿️ PARK ON</b>\n\n"
             f"Deals park ho rahi hain, har ghante ke top pe "
-            f"(agla: <b>{nxt.strftime('%H:00')}</b>) ek saath jaayengi.\n"
+            f"(agla: <b>{_next_batch_label()}</b>) ek saath jaayengi.\n"
             f"Amazon deals discount ke hisaab se sorted, non-Amazon "
             f"beech mein arrival order se.\n\n"
             f"Queue mein: <b>{amz_n}</b> Amazon + <b>{oth_n}</b> other\n"
@@ -523,24 +562,33 @@ def _park_kb(cfg: dict, pending: int) -> InlineKeyboardMarkup:
 def _setbutton_status_text(btns: dict) -> str:
     b1   = btns.get("btn1", {})
     b2   = btns.get("btn2", {})
+    buy  = btns.get("buy", {})
     cart = btns.get("cart", {})
+    link_note = ("caption se link <b>hat jaata</b> hai"
+                 if buy.get("enabled") else "caption mein link <b>aata</b> hai")
     return (
+        f"⚡ <b>Buy Now</b> — {_onoff(buy.get('enabled'))}\n"
+        f"   Naam: {html_lib.escape(buy.get('label', '-'))}\n"
+        f"   <i>ON hone pe {link_note}.</i>\n\n"
         f"🛒 <b>Add to Cart</b> — {_onoff(cart.get('enabled'))}\n"
         f"   Naam: {html_lib.escape(cart.get('label', '-'))}\n"
-        f"   <i>Sirf Amazon post ke neeche. Cart mein daalne se "
-        f"attribution 24 ghante se 89 din ho jaati hai.</i>\n\n"
+        f"   <i>Cart mein daalne se attribution 24 ghante se 89 din ho jaati hai.</i>\n\n"
         f"📌 <b>Button 1</b> — {_onoff(b1.get('enabled'))}\n"
         f"   Naam: {html_lib.escape(b1.get('label', '-'))}\n"
         f"   Link: <code>{html_lib.escape(b1.get('url') or '—')}</code>\n\n"
         f"📌 <b>Button 2</b> — {_onoff(b2.get('enabled'))}\n"
         f"   Naam: {html_lib.escape(b2.get('label', '-'))}\n"
-        f"   Link: <code>{html_lib.escape(b2.get('url') or '—')}</code>"
+        f"   Link: <code>{html_lib.escape(b2.get('url') or '—')}</code>\n\n"
+        f"<i>Buy Now aur Cart sirf Amazon post pe lagte hain.</i>"
     )
 
 
 def _setbutton_main_kb(btns: dict) -> InlineKeyboardMarkup:
+    buy  = btns.get("buy", {})
     cart = btns.get("cart", {})
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{_onoff(buy.get('enabled'))} Buy Now",
+                              callback_data="sb_buy")],
         [InlineKeyboardButton(f"{_onoff(cart.get('enabled'))} Add to Cart",
                               callback_data="sb_cart")],
         [InlineKeyboardButton(f"✏️ {btns.get('btn1', {}).get('label', 'Button 1')}",
@@ -548,6 +596,29 @@ def _setbutton_main_kb(btns: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"✏️ {btns.get('btn2', {}).get('label', 'Button 2')}",
                               callback_data="sb_btn2")],
         [InlineKeyboardButton("❌ Close", callback_data="cancel")],
+    ])
+
+
+def _buy_detail_text(buy: dict) -> str:
+    return (
+        f"⚡ <b>Buy Now Button</b>\n\n"
+        f"Naam   : <b>{html_lib.escape(buy.get('label', '-'))}</b>\n"
+        f"Status : {_onoff(buy.get('enabled'))}\n\n"
+        f"<i>Link bot khud banata hai (ASIN + tera tag). Sirf Amazon "
+        f"product post pe dikhta hai.</i>\n\n"
+        f"<b>ON</b> → caption se link line hat jaati hai, link button mein aa jaata hai\n"
+        f"<b>OFF</b> → caption mein link line aati hai jaise baaki post mein\n\n"
+        f"<i>Button ka color Telegram apne theme se deta hai, "
+        f"bot badal nahi sakta — emoji se hi alag dikhega.</i>"
+    )
+
+
+def _buy_detail_kb(buy: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Rename", callback_data="sb_buy_rename")],
+        [InlineKeyboardButton("🔴 Turn OFF" if buy.get("enabled") else "🟢 Turn ON",
+                              callback_data="sb_buy_toggle")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="sb_main")],
     ])
 
 
@@ -644,7 +715,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔝 /header — Post ka header\n"
         "🔚 /footer — Post ka footer\n"
         "🖼️ /watermark — Watermark on/off + text\n"
-        "🎛️ /setbutton — Buttons + Add to Cart\n"
+        "🎛️ /setbutton — Buy Now / Cart / custom buttons\n"
         "🧪 /testamz — Amazon API test\n"
         "💾 /exportconfig — Config backup\n\n"
         "<b>⚡ Shortcuts</b>\n"
@@ -674,12 +745,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ <b>Bot Status</b>\n",
         f"📥 Draft  : <code>{html_lib.escape(cfg.get('source_channel') or '❌ /setsource')}</code>",
         f"📢 Post   : <code>{html_lib.escape(cfg.get('channel') or '❌ /setchannel')}</code>\n",
-        f"🅿️ Mode      : <b>{'PARK (hourly)' if cfg.get('park_post') else 'INSTANT'}</b>",
+        f"🅿️ Mode      : <b>{'PARK (hourly)' if cfg.get('park_post') else 'INSTANT'}</b>"
+        + (f" — agli batch <b>{_next_batch_label()}</b>" if cfg.get('park_post') else ""),
         f"📋 Queue     : {amz_n} Amazon + {oth_n} other",
+        f"🕐 Time      : <b>{hhmm(now_local())}</b> ({TZ_NAME})",
         f"🔔 Notify    : {'🔕 Silent' if cfg.get('silent') else '🔔 Loud'}",
         f"🛍️ Amazon    : <b>{'DETAILED' if cfg.get('amz_detailed') else 'MINIMAL (price+link)'}</b>",
         f"🖼️ Image     : {_onoff(f.get('image'))}   Watermark: {_onoff(wm.get('enabled'))}",
         f"🔝 Header    : {_onoff(hdr.get('enabled'))}   🔚 Footer: {_onoff(ftr.get('enabled'))}\n",
+        f"⚡ Buy Now   : {_onoff(btns.get('buy', {}).get('enabled'))}"
+        + ("   <i>(link button mein)</i>"
+           if btns.get('buy', {}).get('enabled') else "   <i>(link caption mein)</i>"),
         f"🛒 Cart btn  : {_onoff(btns.get('cart', {}).get('enabled'))}",
         f"📌 Button 1  : {_onoff(btns.get('btn1', {}).get('enabled'))} "
         f"{html_lib.escape(btns.get('btn1', {}).get('label', '-'))}",
@@ -726,9 +802,8 @@ async def cmd_park_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if a in ("on", "chalu"):
             cfg["park_post"] = True
             save_config(cfg)
-            nxt = (datetime.now() + timedelta(hours=1)).replace(minute=0)
             await update.message.reply_text(
-                f"🅿️ <b>Park mode ON.</b>\nAgli batch <b>{nxt.strftime('%H:00')}</b> baje.",
+                f"🅿️ <b>Park mode ON.</b>\nAgli batch <b>{_next_batch_label()}</b> baje.",
                 parse_mode=ParseMode.HTML)
             return
         if a in ("off", "band"):
@@ -1219,7 +1294,7 @@ async def flush_queue(app, reason: str = "hourly"):
                 await asyncio.sleep(POST_GAP_SECONDS)
 
         # ── Summary ───────────────────────────────────────────────────────
-        lines = [f"📤 <b>Batch bhej di</b> ({reason})\n"]
+        lines = [f"📤 <b>Batch bhej di</b> — {hhmm(now_local())} ({reason})\n"]
         lines.append(f"✅ Post  : <b>{posted}</b>")
         for t in titles:
             lines.append(f"   • {html_lib.escape(t[:50])}")
@@ -1363,14 +1438,13 @@ async def process_and_post(context, msg, notify, cfg=None,
                 added = sum(1 for p in products if queue_add_amazon(p["asin"]))
                 skip  = len(products) - added
                 amz_n, oth_n = queue_counts()
-                nxt = (datetime.now() + timedelta(hours=1)).replace(minute=0)
                 lines = [f"🅿️ <b>{added} deal queue mein daal di.</b>"]
                 if skip:
                     lines.append(f"🔁 {skip} pehle se queue mein thi.")
                 if searches:
                     lines.append(f"🚫 {len(searches)} search page ignore.")
                 lines.append(f"\n📋 Queue: {amz_n} Amazon + {oth_n} other")
-                lines.append(f"🕐 Agli batch: <b>{nxt.strftime('%H:00')}</b>")
+                lines.append(f"🕐 Agli batch: <b>{_next_batch_label()}</b>")
                 await _edit_or_notify(wait_msg, notify, "\n".join(lines),
                                       parse_mode=ParseMode.HTML)
                 return
@@ -1503,11 +1577,10 @@ async def process_and_post(context, msg, notify, cfg=None,
     if parking:
         queue_add_other(payload)
         amz_n, oth_n = queue_counts()
-        nxt = (datetime.now() + timedelta(hours=1)).replace(minute=0)
         await notify(
             f"🅿️ <b>Queue mein daal diya.</b>\n\n"
             f"📋 Queue: {amz_n} Amazon + {oth_n} other\n"
-            f"🕐 Agli batch: <b>{nxt.strftime('%H:00')}</b>",
+            f"🕐 Agli batch: <b>{_next_batch_label()}</b>",
             parse_mode=ParseMode.HTML)
         return
 
@@ -1755,6 +1828,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    _setbutton_main_kb(btns))
         return
 
+    if data == "sb_buy":
+        buy = load_config().get("buttons", {}).get("buy", {})
+        await show(_buy_detail_text(buy), _buy_detail_kb(buy))
+        return
+
+    if data == "sb_buy_toggle":
+        cfg = load_config()
+        buy = cfg.setdefault("buttons", {}).setdefault("buy", {})
+        buy["enabled"] = not buy.get("enabled", False)
+        save_config(cfg)
+        await show(_buy_detail_text(buy), _buy_detail_kb(buy))
+        return
+
+    if data == "sb_buy_rename":
+        context.user_data["action"] = "sb_wait_label"
+        context.user_data["sb_key"] = "buy"
+        await show("📝 Buy Now button ka naya naam type karo (max 20):")
+        return
+
     if data == "sb_cart":
         cart = load_config().get("buttons", {}).get("cart", {})
         await show(_cart_detail_text(cart), _cart_detail_kb(cart))
@@ -1817,6 +1909,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key == "cart":
             await show("✅ <b>Saved!</b>\n\n" + _cart_detail_text(btn),
                        _cart_detail_kb(btn))
+        elif key == "buy":
+            await show("✅ <b>Saved!</b>\n\n" + _buy_detail_text(btn),
+                       _buy_detail_kb(btn))
         else:
             await show("✅ <b>Saved!</b>\n\n" + _btn_detail_text(key, btn),
                        _setbutton_detail_kb(key, btn))
@@ -1976,7 +2071,7 @@ def main():
             ("header",       "🔝 Post ka header"),
             ("footer",       "🔚 Post ka footer"),
             ("watermark",    "🖼️ Watermark on/off + text"),
-            ("setbutton",    "🎛️ Buttons + Add to Cart"),
+            ("setbutton",    "🎛️ Buy Now / Cart / buttons"),
             ("testamz",      "🧪 Amazon API test"),
             ("exportconfig", "💾 Config backup"),
         ])
