@@ -29,18 +29,13 @@ SCOPE    = "creatorsapi::default" if CREDENTIAL_VERSION.startswith("3.") else "c
 API_BASE = "https://creatorsapi.amazon"
 ITEMS_EP = f"{API_BASE}/catalog/v1/getItems"
 
+# Ek call mein max 10 ASIN — Amazon ki limit
+MAX_ASINS_PER_CALL = 10
+
 ASIN_PAT = re.compile(r"/(?:dp|gp/product|exec/obidos/ASIN|o/ASIN)/([A-Za-z0-9]{10})")
 
-# Short / modern Amazon URL types that need redirect resolution
-NEEDS_REDIRECT = (
-    "amzn.to", "amzn.in", "amzn.eu", "amzn.asia",
-    "a.co",
-    "link.amazon",
-)
+NEEDS_REDIRECT = ("amzn.to", "amzn.in", "amzn.eu", "amzn.asia", "a.co", "link.amazon")
 
-# Search / browse / listing page markers.
-# NOTE: ASIN check ALWAYS runs first — a product link that came out of a search
-# (…/dp/B0XXXX/ref=sr_1_1?keywords=shoes) is a product, not a search page.
 SEARCH_MARKERS = (
     "/s?", "/s/", "/search",
     "field-keywords", "keywords=", "k=",
@@ -59,9 +54,16 @@ PRODUCT_RESOURCES = [
     "images.primary.large",
     "images.primary.medium",
     "itemInfo.title",
+    "itemInfo.features",
+    "itemInfo.byLineInfo",
     "offersV2.listings.price",
     "offersV2.listings.availability",
     "offersV2.listings.condition",
+    "offersV2.listings.dealDetails",
+    "offersV2.listings.merchantInfo",
+    "offersV2.listings.isBuyBoxWinner",
+    "browseNodeInfo.websiteSalesRank",
+    "browseNodeInfo.browseNodes",
     "customerReviews.count",
     "customerReviews.starRating",
 ]
@@ -82,7 +84,7 @@ async def _get_token() -> str | None:
         return None
 
     is_lwa = CREDENTIAL_VERSION.startswith("3.")
-    token_payload = {
+    payload = {
         "grant_type":    "client_credentials",
         "client_id":     CREDENTIAL_ID,
         "client_secret": CREDENTIAL_SECRET,
@@ -93,15 +95,13 @@ async def _get_token() -> str | None:
         async with aiohttp.ClientSession() as session:
             if is_lwa:
                 req = session.post(
-                    token_url,
-                    json=token_payload,
+                    token_url, json=payload,
                     headers={"Content-Type": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=15),
                 )
             else:
                 req = session.post(
-                    token_url,
-                    data=token_payload,
+                    token_url, data=payload,
                     timeout=aiohttp.ClientTimeout(total=15),
                 )
             async with req as resp:
@@ -121,6 +121,9 @@ async def _get_token() -> str | None:
         return None
 
 
+# =============================================================================
+# URL HELPERS
+# =============================================================================
 def extract_asin(url: str) -> str | None:
     if not url:
         return None
@@ -133,7 +136,6 @@ def extract_asin(url: str) -> str | None:
     q = re.search(r"[?&]ASIN=([A-Za-z0-9]{10})", url)
     if q:
         return q.group(1).upper()
-    # link.amazon/ASIN style: path segment that looks like ASIN
     try:
         path = urllib.parse.urlparse(url).path.strip("/")
     except Exception:
@@ -144,11 +146,7 @@ def extract_asin(url: str) -> str | None:
 
 
 def is_amazon_url(url: str) -> bool:
-    """
-    Detect Amazon URLs including short links.
-    'amazon'/'amzn' must be a WHOLE domain label — so fakeamazon.xyz
-    aur amazon-deals.ru jaise fake domains pakde nahi jayenge.
-    """
+    """'amazon'/'amzn' poora domain label hona chahiye — fake domains pakde nahi jayenge."""
     try:
         host = urllib.parse.urlparse(url).netloc.lower().split(":")[0].strip(".")
     except Exception:
@@ -157,16 +155,11 @@ def is_amazon_url(url: str) -> bool:
         return False
     if host in ("a.co", "www.a.co"):
         return True
-    labels = host.split(".")
-    return any(lbl in ("amazon", "amzn") for lbl in labels)
+    return any(lbl in ("amazon", "amzn") for lbl in host.split("."))
 
 
 def is_amazon_search_url(url: str) -> bool:
-    """
-    Search / browse / deals / storefront page hai ya nahi.
-    IMPORTANT: caller ko pehle extract_asin() try karna chahiye — agar ASIN
-    mil gaya to wo product link hai, chahe usme search markers ho.
-    """
+    """Search/browse/deals page hai ya nahi. Caller pehle extract_asin() try kare."""
     if not url:
         return False
     low = url.lower()
@@ -190,7 +183,6 @@ def is_amazon_search_url(url: str) -> bool:
 
 
 def needs_redirect(url: str) -> bool:
-    """Returns True if URL is a short link that needs redirect resolution."""
     return any(d in url for d in NEEDS_REDIRECT)
 
 
@@ -199,25 +191,37 @@ def _strip_tag_param(url: str) -> str:
         parsed = urllib.parse.urlparse(url)
         params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         params.pop("tag", None)
-        new_query = urllib.parse.urlencode(params, doseq=True)
-        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+        return urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(params, doseq=True))
+        )
     except Exception:
         return url
 
 
 def make_affiliate_url(asin: str) -> str:
     base = f"https://{MARKETPLACE}/dp/{asin}"
-    if PARTNER_TAG:
-        return f"{base}?tag={PARTNER_TAG}"
-    return base
+    return f"{base}?tag={PARTNER_TAG}" if PARTNER_TAG else base
+
+
+def make_cart_url(asin: str) -> str:
+    """
+    Add-to-Cart link. Cart mein daalne se attribution window
+    24 ghante se 89 din tak badh jaati hai.
+    """
+    if not asin:
+        return ""
+    return (
+        f"https://{MARKETPLACE}/gp/aws/cart/add.html"
+        f"?AssociateTag={urllib.parse.quote(PARTNER_TAG)}"
+        f"&ASIN.1={asin}&Quantity.1=1"
+    )
 
 
 async def _resolve_redirect(url: str) -> str:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                url,
-                allow_redirects=True,
+                url, allow_redirects=True,
                 timeout=aiohttp.ClientTimeout(total=10),
                 headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"},
             ) as resp:
@@ -227,7 +231,6 @@ async def _resolve_redirect(url: str) -> str:
 
 
 async def resolve_amazon_url(url: str) -> str:
-    """Short link ho to resolve karke asli URL do, warna waise hi."""
     if needs_redirect(url):
         return await _resolve_redirect(url)
     return url
@@ -236,12 +239,9 @@ async def resolve_amazon_url(url: str) -> str:
 async def get_short_affiliate_link(url: str) -> str:
     asin = extract_asin(url)
     if not asin:
-        resolved = await _resolve_redirect(url)
-        asin = extract_asin(resolved)
-
+        asin = extract_asin(await _resolve_redirect(url))
     if asin:
         return make_affiliate_url(asin)
-
     cleaned = _strip_tag_param(url)
     if PARTNER_TAG:
         sep = "&" if "?" in cleaned else "?"
@@ -249,116 +249,258 @@ async def get_short_affiliate_link(url: str) -> str:
     return cleaned
 
 
+# =============================================================================
+# RESPONSE PARSING
+# =============================================================================
 def _parse_item(item: dict) -> dict:
-    result: dict = {}
+    r: dict = {}
 
-    title_data    = item.get("itemInfo", {}).get("title", {})
-    result["title"] = (title_data.get("displayValue", "") if title_data else "").strip()
+    info = item.get("itemInfo") or {}
 
-    img_primary = item.get("images", {}).get("primary", {})
-    img = img_primary.get("large") or img_primary.get("medium") or img_primary.get("small") or {}
-    result["image_url"] = img.get("url", "") if img else ""
+    title_data = info.get("title") or {}
+    r["title"] = (title_data.get("displayValue") or "").strip()
 
-    result["deal_price"]    = ""
-    result["actual_price"]  = ""
-    result["deal_amount"]   = 0.0
-    result["actual_amount"] = 0.0
-    result["discount_pct"]  = 0
-    result["savings"]       = ""
+    img_primary = (item.get("images") or {}).get("primary") or {}
+    img = (img_primary.get("large") or img_primary.get("medium")
+           or img_primary.get("small") or {})
+    r["image_url"] = (img or {}).get("url", "") or ""
 
-    listings = item.get("offersV2", {}).get("listings", [])
+    # ── Brand ──────────────────────────────────────────────────────────────
+    byline = info.get("byLineInfo") or {}
+    brand  = (byline.get("brand") or {}).get("displayValue", "")
+    if not brand:
+        brand = (byline.get("manufacturer") or {}).get("displayValue", "")
+    r["brand"] = (brand or "").strip()
+
+    # ── Features ───────────────────────────────────────────────────────────
+    feats = (info.get("features") or {}).get("displayValues") or []
+    r["features"] = [f for f in feats if f]
+
+    # ── Price block ────────────────────────────────────────────────────────
+    r["deal_price"]    = ""
+    r["actual_price"]  = ""
+    r["deal_amount"]   = 0.0
+    r["actual_amount"] = 0.0
+    r["discount_pct"]  = 0
+    r["savings"]       = ""
+    r["stock_note"]    = ""
+    r["seller"]        = ""
+    r["deal_badge"]    = ""
+    r["deal_ends"]     = ""
+
+    listings = (item.get("offersV2") or {}).get("listings") or []
     if listings:
         listing   = listings[0]
-        price_obj = listing.get("price", {})
-        money     = price_obj.get("money", {})
+        price_obj = listing.get("price") or {}
+        money     = price_obj.get("money") or {}
         if money:
-            result["deal_price"]  = money.get("displayAmount", "")
-            result["deal_amount"] = float(money.get("amount", 0) or 0)
+            r["deal_price"]  = money.get("displayAmount", "") or ""
+            try:
+                r["deal_amount"] = float(money.get("amount", 0) or 0)
+            except (TypeError, ValueError):
+                r["deal_amount"] = 0.0
 
-        savings_obj = price_obj.get("savings", {})
-        sav_money   = savings_obj.get("money", {})
+        savings_obj = price_obj.get("savings") or {}
+        sav_money   = savings_obj.get("money") or {}
         if sav_money:
-            sav_amt = float(sav_money.get("amount", 0) or 0)
-            result["savings"] = sav_money.get("displayAmount", "")
-            if sav_amt and result["deal_amount"]:
-                mrp_amt                 = result["deal_amount"] + sav_amt
-                result["actual_amount"] = mrp_amt
-                result["actual_price"]  = f"₹{mrp_amt:,.0f}"
+            try:
+                sav_amt = float(sav_money.get("amount", 0) or 0)
+            except (TypeError, ValueError):
+                sav_amt = 0.0
+            r["savings"] = sav_money.get("displayAmount", "") or ""
+            if sav_amt and r["deal_amount"]:
+                mrp = r["deal_amount"] + sav_amt
+                r["actual_amount"] = mrp
+                r["actual_price"]  = f"₹{mrp:,.0f}"
 
         pct = savings_obj.get("percentage")
         if pct is not None:
-            result["discount_pct"] = int(pct)
-        elif result["deal_amount"] and result["actual_amount"]:
             try:
-                result["discount_pct"] = round(
-                    (result["actual_amount"] - result["deal_amount"]) / result["actual_amount"] * 100
+                r["discount_pct"] = int(pct)
+            except (TypeError, ValueError):
+                pass
+        elif r["deal_amount"] and r["actual_amount"]:
+            try:
+                r["discount_pct"] = round(
+                    (r["actual_amount"] - r["deal_amount"]) / r["actual_amount"] * 100
                 )
             except Exception:
                 pass
 
-    cr   = item.get("customerReviews", {})
-    star = cr.get("starRating", {})
-    result["rating"]       = str(star.get("value", "")).strip() if star else ""
-    count                  = cr.get("count")
-    result["review_count"] = f"{count:,}" if isinstance(count, int) else str(count or "")
+        # ── Stock ──────────────────────────────────────────────────────────
+        avail = listing.get("availability") or {}
+        msg   = (avail.get("message") or "").strip()
+        maxq  = avail.get("maxOrderQuantity")
+        if msg:
+            r["stock_note"] = msg
+        elif isinstance(maxq, int) and 0 < maxq <= 10:
+            r["stock_note"] = f"Sirf {maxq} bache hain"
 
-    return result
+        # ── Seller ─────────────────────────────────────────────────────────
+        merch = listing.get("merchantInfo") or {}
+        r["seller"] = (merch.get("name") or "").strip()
+
+        # ── Deal details ───────────────────────────────────────────────────
+        deal = listing.get("dealDetails") or {}
+        badge = (deal.get("badge") or deal.get("dealBadge")
+                 or deal.get("accessType") or "")
+        if isinstance(badge, dict):
+            badge = badge.get("displayValue", "") or badge.get("label", "")
+        badge = str(badge or "").replace("_", " ").strip()
+        if badge:
+            r["deal_badge"] = badge.title() if badge.isupper() else badge
+
+        ends = deal.get("endTime") or deal.get("endDate") or ""
+        if ends:
+            r["deal_ends"] = _humanise_deal_end(str(ends))
+
+        if deal.get("percentClaimed") is not None and not r["deal_ends"]:
+            try:
+                claimed = int(deal["percentClaimed"])
+                if claimed > 0:
+                    r["deal_ends"] = f"{claimed}% claimed"
+            except (TypeError, ValueError):
+                pass
+
+    # ── Sales rank ─────────────────────────────────────────────────────────
+    bni  = item.get("browseNodeInfo") or {}
+    rank = bni.get("websiteSalesRank") or {}
+    r["sales_rank"] = ""
+    if rank:
+        num = rank.get("salesRank")
+        cat = (rank.get("contextFreeName") or rank.get("displayName") or "").strip()
+        if num and cat:
+            r["sales_rank"] = f"#{num:,} in {cat}"
+
+    nodes = bni.get("browseNodes") or []
+    r["category"] = ""
+    if nodes:
+        r["category"] = (nodes[0].get("contextFreeName")
+                         or nodes[0].get("displayName") or "").strip()
+
+    # ── Reviews ────────────────────────────────────────────────────────────
+    cr   = item.get("customerReviews") or {}
+    star = cr.get("starRating") or {}
+    r["rating"] = str(star.get("value", "")).strip() if star else ""
+    count       = cr.get("count")
+    r["review_count"] = f"{count:,}" if isinstance(count, int) else str(count or "")
+
+    # ── Amazon ka apna tagged link (hamare banaye se behtar) ───────────────
+    r["detail_url"] = item.get("detailPageURL", "") or ""
+
+    return r
 
 
-async def get_product_by_asin(asin: str) -> dict | None:
+def _humanise_deal_end(raw: str) -> str:
+    """ISO timestamp ko 'X ghante baaki' mein badlo."""
+    try:
+        cleaned = raw.replace("Z", "+00:00")
+        end     = datetime.fromisoformat(cleaned)
+        if end.tzinfo:
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now()
+        secs = (end - now).total_seconds()
+        if secs <= 0:
+            return "khatam"
+        hours = int(secs // 3600)
+        mins  = int((secs % 3600) // 60)
+        if hours >= 1:
+            return f"{hours} ghante baaki"
+        return f"{mins} minute baaki"
+    except Exception:
+        return ""
+
+
+# =============================================================================
+# API CALLS
+# =============================================================================
+async def _call_get_items(asins: list) -> dict:
+    """Ek call, max 10 ASIN. Returns {asin: parsed_product}."""
     token = await _get_token()
     if not token:
-        return None
+        return {}
 
     payload = {
+        "itemIds":    asins,
+        "itemIdType": "ASIN",
+        "marketplace": MARKETPLACE,
         "partnerTag": PARTNER_TAG,
-        "itemIds":    [asin],
         "resources":  PRODUCT_RESOURCES,
     }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                ITEMS_EP,
-                json=payload,
+                ITEMS_EP, json=payload,
                 headers={
                     "Authorization": f"Bearer {token}",
                     "x-marketplace": MARKETPLACE,
                     "Content-Type":  "application/json",
                 },
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=25),
             ) as resp:
                 if resp.status == 403:
                     _token_cache["token"]      = None
                     _token_cache["expires_at"] = None
                     logger.error("Amazon API 403 — token invalidated")
-                    return None
+                    return {}
                 if resp.status not in (200, 206):
                     body = await resp.text()
                     logger.error(f"GetItems {resp.status}: {body[:300]}")
-                    return None
-                data  = await resp.json()
-                items = data.get("itemsResult", {}).get("items", [])
-                if items:
-                    parsed = _parse_item(items[0])
-                    parsed["asin"]           = asin
-                    parsed["affiliate_link"] = make_affiliate_url(asin)
-                    logger.info(f"Creators API product mila: {asin}")
-                    return parsed
-                errors = data.get("errors", [])
-                msg    = errors[0].get("message", "") if errors else "Product not found"
-                logger.warning(f"ASIN {asin} — {msg}")
-                return None
+                    return {}
+                data = await resp.json()
     except Exception as e:
         logger.error(f"GetItems call fail: {e}")
-        return None
+        return {}
+
+    # Docs do naam dikhate hain — dono accept karo, warna chup-chaap fail hoga
+    container = data.get("itemsResult") or data.get("itemResults") or {}
+    items     = container.get("items") or []
+
+    out = {}
+    for item in items:
+        asin = (item.get("asin") or "").upper()
+        if not asin:
+            continue
+        parsed = _parse_item(item)
+        parsed["asin"] = asin
+        parsed["affiliate_link"] = parsed.get("detail_url") or make_affiliate_url(asin)
+        parsed["cart_link"]      = make_cart_url(asin)
+        out[asin] = parsed
+
+    for err in (data.get("errors") or []):
+        logger.warning(f"GetItems error: {err.get('code')} — {err.get('message', '')[:120]}")
+
+    return out
+
+
+async def get_products_by_asins(asins: list) -> dict:
+    """Kai ASIN ka data lao — 10-10 ke batch mein. Returns {asin: product}."""
+    uniq = []
+    seen = set()
+    for a in asins:
+        a = (a or "").upper()
+        if a and a not in seen:
+            seen.add(a)
+            uniq.append(a)
+
+    result = {}
+    for i in range(0, len(uniq), MAX_ASINS_PER_CALL):
+        chunk = uniq[i:i + MAX_ASINS_PER_CALL]
+        result.update(await _call_get_items(chunk))
+    logger.info(f"Amazon API: {len(uniq)} ASIN maange, {len(result)} mile")
+    return result
+
+
+async def get_product_by_asin(asin: str) -> dict | None:
+    got = await get_products_by_asins([asin])
+    return got.get((asin or "").upper())
 
 
 async def enrich_amazon_url(url: str) -> dict | None:
     resolved = await resolve_amazon_url(url)
-
-    asin = extract_asin(resolved)
-    if not asin:
-        asin = extract_asin(url)
+    asin = extract_asin(resolved) or extract_asin(url)
     if asin:
         return await get_product_by_asin(asin)
     logger.warning(f"ASIN nahi mila: {url[:80]}")
