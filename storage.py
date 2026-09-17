@@ -51,7 +51,8 @@ DEFAULT_CONFIG = {
     "buttons": {
         "btn1": {"label": "Join Channel", "url": "", "enabled": False},
         "btn2": {"label": "More Deals",   "url": "", "enabled": False},
-        "cart": {"label": "🛒 Add to Cart",              "enabled": False},
+        "buy":  {"label": "⚡ Buy Now",     "enabled": False},
+        "cart": {"label": "🛒 Add to Cart", "enabled": False},
     },
 }
 
@@ -141,6 +142,9 @@ def _fill_defaults(cfg: dict) -> dict:
     b2.setdefault("label", "More Deals")
     b2.setdefault("url", "")
     b2.setdefault("enabled", False)
+    buy = btns.setdefault("buy", {})
+    buy.setdefault("label", "⚡ Buy Now")
+    buy.setdefault("enabled", False)
     cart = btns.setdefault("cart", {})
     cart.setdefault("label", "🛒 Add to Cart")
     cart.setdefault("enabled", False)
