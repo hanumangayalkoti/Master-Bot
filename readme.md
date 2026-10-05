@@ -33,6 +33,8 @@ Command	Kaam
 /start	Bot ki info
 /help	Sare commands
 /status	Channel aur buttons ka status
+/pause	Saari forwarding band — DM, draft channel, queue, hourly batch kuch bhi post nahi hoga (restart ke baad bhi paused rahega)
+/resume	Forwarding fir se chalu
 /setchannel	Post karne wala channel set karo
 /setbutton	Har post ke neeche 2 customisable buttons set karo
 /testamz	Amazon Creators API test karo

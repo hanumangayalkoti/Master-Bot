@@ -97,6 +97,27 @@ _own_msg_set = set()
 # Ek hi batch chale — overlap se bachne ke liye
 _flush_lock = asyncio.Lock()
 
+# ── PAUSE ────────────────────────────────────────────────────────────────
+# /pause → koi bhi post channel pe nahi jayegi (DM, draft, queue, hourly — sab band).
+# Config mein bhi save hota hai taaki restart ke baad bhi paused rahe.
+_paused = False
+
+
+class BotPaused(Exception):
+    pass
+
+
+def is_paused() -> bool:
+    return _paused
+
+
+def set_paused(value: bool) -> bool:
+    global _paused
+    _paused = bool(value)
+    cfg = load_config()
+    cfg["paused"] = _paused
+    return save_config(cfg)
+
 
 def _remember_own(m):
     if not m:
@@ -706,6 +727,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ /start — Bot ki info\n"
         "📖 /help — Ye list\n"
         "📊 /status — Poora status\n"
+        "⏸️ /pause — Saari forwarding band\n"
+        "▶️ /resume — Forwarding fir se chalu\n"
         "📢 /setchannel — Post channel\n"
         "📥 /setsource — Draft channel (auto pickup)\n"
         "🛍️ /amz_post — Amazon post ki har detail on/off\n"
@@ -728,6 +751,43 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    saved = set_paused(True)
+    amz_n, oth_n = queue_counts()
+    await update.message.reply_text(
+        "⏸️ <b>Bot PAUSED!</b>\n\n"
+        "🚫 Ab koi bhi post channel pe nahi jayegi — DM, draft channel, "
+        "queue, hourly batch sab band.\n"
+        "Chal rahi batch bhi turant ruk jayegi.\n"
+        f"📋 Queue mein pade: {amz_n} Amazon + {oth_n} other (wahin rahenge)\n\n"
+        "▶️ Wapas chalu karne ke liye /resume"
+        + ("" if saved else "\n\n⚠️ DB mein save nahi hua — restart pe pause hat sakta hai."),
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    saved = set_paused(False)
+    amz_n, oth_n = queue_counts()
+    cfg = load_config()
+    lines = ["▶️ <b>Bot RESUMED!</b> Forwarding fir se chalu."]
+    if amz_n + oth_n:
+        lines.append(f"\n📋 Queue: {amz_n} Amazon + {oth_n} other")
+        if cfg.get("park_post"):
+            lines.append(f"🕐 Agli batch: <b>{_next_batch_label()}</b> "
+                         f"(abhi bhejna hai to /queue)")
+        else:
+            lines.append("📤 Queue abhi bhej raha hoon...")
+            context.application.create_task(
+                flush_queue(context.application, reason="resume"))
+    if not saved:
+        lines.append("\n⚠️ DB mein save nahi hua — restart pe fir paused ho sakta hai.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
@@ -743,6 +803,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         "⚙️ <b>Bot Status</b>\n",
+        ("⏸️ <b>PAUSED</b> — kuch post nahi ho raha (/resume)\n" if is_paused()
+         else "▶️ <b>RUNNING</b>\n"),
         f"📥 Draft  : <code>{html_lib.escape(cfg.get('source_channel') or '❌ /setsource')}</code>",
         f"📢 Post   : <code>{html_lib.escape(cfg.get('channel') or '❌ /setchannel')}</code>\n",
         f"🅿️ Mode      : <b>{'PARK (hourly)' if cfg.get('park_post') else 'INSTANT'}</b>"
@@ -1026,6 +1088,8 @@ async def _send_with_retry(coro_factory, tries: int = 3):
     """
     last_err = None
     for attempt in range(tries):
+        if is_paused():
+            raise BotPaused("Bot paused hai — /resume karo")
         try:
             return await coro_factory()
         except RetryAfter as e:
@@ -1214,6 +1278,10 @@ async def flush_queue(app, reason: str = "hourly"):
         logger.info(f"Flush ({reason}) skip — pichhli batch chal rahi hai")
         return
 
+    if is_paused():
+        logger.info(f"Flush ({reason}) skip — bot paused hai")
+        return
+
     async with _flush_lock:
         cfg = load_config()
         channel = cfg.get("channel", "").strip()
@@ -1264,8 +1332,13 @@ async def flush_queue(app, reason: str = "hourly"):
 
         posted = dupes = errors = 0
         titles = []
+        paused_left = 0
 
         for idx, it in enumerate(ordered):
+            if is_paused():
+                paused_left = len(ordered) - idx
+                logger.info(f"Flush ({reason}) beech mein ruki — paused")
+                break
             try:
                 if it["kind"] == "amazon":
                     status, detail, _ = await post_amazon_product(
@@ -1275,6 +1348,11 @@ async def flush_queue(app, reason: str = "hourly"):
             except Exception as e:
                 logger.error(f"Flush item fail: {e}")
                 status, detail = "error", str(e)[:80]
+
+            if status == "error" and is_paused():
+                # pause ki wajah se fail — item queue mein hi rahe, try count na badhe
+                paused_left = len(ordered) - idx
+                break
 
             if status == "posted":
                 posted += 1
@@ -1306,6 +1384,8 @@ async def flush_queue(app, reason: str = "hourly"):
             lines.append(f"❌ Fail (wapas queue mein) : {errors}")
         if purged:
             lines.append(f"🗑️ {QUEUE_MAX_AGE_HOURS}h se purane drop : {purged}")
+        if paused_left:
+            lines.append(f"⏸️ Pause ki wajah se ruki — {paused_left} queue mein baaki")
         lines.append(f"\n📢 <code>{html_lib.escape(channel)}</code>")
 
         if ADMIN_ID:
@@ -1395,6 +1475,11 @@ async def process_and_post(context, msg, notify, cfg=None,
         await notify("⚠️ Message mein koi text ya link nahi mila.")
         return
 
+    if is_paused():
+        await notify("⏸️ <b>Bot paused hai</b> — post nahi kiya.\n/resume karo.",
+                     parse_mode=ParseMode.HTML)
+        return
+
     if cfg is None:
         cfg = load_config()
     channel = cfg.get("channel", "").strip()
@@ -1460,7 +1545,11 @@ async def process_and_post(context, msg, notify, cfg=None,
             live.sort(key=lambda x: int(x.get("discount_pct") or 0), reverse=True)
             nodata = [p["asin"] for p in products if p["asin"] not in fetched]
 
+            paused_left = 0
             for i, prod in enumerate(live):
+                if is_paused():
+                    paused_left = len(live) - i
+                    break
                 status, detail, n = await post_amazon_product(context, prod, cfg)
                 if status == "posted":
                     posted.append(detail)
@@ -1523,6 +1612,8 @@ async def process_and_post(context, msg, notify, cfg=None,
                 lines.append(f"⚠️ {len(nodata)} ka data nahi mila")
             if errors:
                 lines.append(f"❌ {len(errors)} fail")
+            if paused_left:
+                lines.append(f"⏸️ Pause ki wajah se {paused_left} post nahi ki")
             if searches:
                 lines.append(f"🚫 {len(searches)} search page ignore")
             if all_skipped:
@@ -1645,6 +1736,9 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if _is_own_message(msg, context.bot.id):
         return
+    if is_paused():
+        logger.info(f"Paused — draft post ignore: {msg.chat.id} / {msg.message_id}")
+        return
 
     cfg    = load_config()
     source = (cfg.get("source_channel") or "").strip()
@@ -1759,6 +1853,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "park_flush":
+        if is_paused():
+            await show("⏸️ <b>Bot paused hai</b> — queue nahi bheji.\n/resume karo pehle.")
+            return
         amz_n, oth_n = queue_counts()
         total = amz_n + oth_n
         if not total:
@@ -2057,11 +2154,18 @@ def main():
 
     init_db()
 
+    global _paused
+    _paused = bool(load_config().get("paused", False))
+    if _paused:
+        logger.warning("Bot PAUSED state mein start hua — /resume se chalu karo")
+
     async def post_init(app):
         await app.bot.set_my_commands([
             ("start",        "ℹ️ Bot ki info"),
             ("help",         "📖 Saari commands"),
             ("status",       "📊 Poora status"),
+            ("pause",        "⏸️ Saari forwarding band"),
+            ("resume",       "▶️ Forwarding chalu"),
             ("setchannel",   "📢 Post channel"),
             ("setsource",    "📥 Draft channel"),
             ("amz_post",     "🛍️ Amazon post ki details on/off"),
@@ -2092,6 +2196,7 @@ def main():
     dm = filters.ChatType.PRIVATE
     for name, fn in [
         ("start", cmd_start), ("help", cmd_help), ("status", cmd_status),
+        ("pause", cmd_pause), ("resume", cmd_resume),
         ("setchannel", cmd_setchannel), ("setsource", cmd_setsource),
         ("amz_post", cmd_amz_post), ("park_post", cmd_park_post),
         ("queue", cmd_queue), ("silent", cmd_silent),

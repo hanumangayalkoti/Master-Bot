@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     "source_channel": "",
     "silent":         True,
     "park_post":      False,
+    "paused":         False,
     "amz_detailed":   True,
     "amz_fields":     DEFAULT_AMZ_FIELDS,
     "header":         {"enabled": True,  "text": "🙏Jai Shree Ram Dosto🙏"},
